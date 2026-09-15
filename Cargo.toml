@@ -68,19 +68,11 @@ panic = { level = "warn", priority = -1 }
 todo = { level = "warn", priority = -1 }
 panic_in_result_fn = { level = "warn", priority = -1 }
 
-[workspace.dependencies]
-tauri = { version = "2", default-features = false }
-tauri-build = { version = "2" }
-tauri-plugin = { version = "2" }
-specta = { version = "=2.0.0-rc.26", features = ["derive"] }
-specta-typescript = { version = "0.0.13" }
-specta-serde = { version = "0.0.13" }
-specta-util = { version = "0.0.13" }
-
-# TODO: Remove once the rc.26 Specta crates are published.
-[patch.crates-io]
-specta = { git = "https://github.com/specta-rs/specta.git", rev = "2757fa8899926dce7da999780c7edf2dc08a732a" }
-specta-macros = { git = "https://github.com/specta-rs/specta.git", rev = "2757fa8899926dce7da999780c7edf2dc08a732a" }
-specta-serde = { git = "https://github.com/specta-rs/specta.git", rev = "2757fa8899926dce7da999780c7edf2dc08a732a" }
-specta-typescript = { git = "https://github.com/specta-rs/specta.git", rev = "2757fa8899926dce7da999780c7edf2dc08a732a" }
-specta-util = { git = "https://github.com/specta-rs/specta.git", rev = "2757fa8899926dce7da999780c7edf2dc08a732a" }
+ [workspace.dependencies]
+tauri = { version = "3.0.0-alpha.0", default-features = false }
+tauri-build = { version = "3.0.0-alpha.0" }
+tauri-plugin = { version = "3.0.0-alpha.0" }
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }
+specta-typescript = { version = "0.0.12" }
+specta-serde = { version = "0.0.12" }
+specta-util = { version = "0.0.12" }
