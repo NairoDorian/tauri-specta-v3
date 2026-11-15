@@ -1,10 +1,15 @@
-use std::{borrow::Cow, path::Path};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use heck::ToLowerCamelCase;
 use specta::{
     Format, Type, Types,
     datatype::{
-        DataType, Field, Fields, NamedDataType, NamedReferenceType, Primitive, Reference, Struct,
+        DataType, Field, Fields, Function, NamedDataType, NamedReferenceType, Primitive, Reference,
+        Struct,
     },
 };
 use specta_serde::Phase;
@@ -19,7 +24,7 @@ impl LanguageExt for specta_typescript::Typescript {
 
     fn export(self, cfg: &BuilderConfiguration, path: &Path) -> Result<(), Self::Error> {
         let cfg = cfg.clone();
-        let types = hide_unused_std_result_type(&cfg, cfg.types.clone());
+        let types = hide_ipc_standins(hide_unused_std_result_type(&cfg, cfg.types.clone()));
         let format = SpectaFormat::new(&cfg);
 
         Exporter::from(self)
@@ -32,6 +37,7 @@ impl LanguageExt for specta_typescript::Typescript {
                     if cfg.typed_error_impl.is_empty() {
                         match cfg.error_handling {
                             ErrorHandlingMode::DataError => DATA_ERROR_IMPL_TS,
+                            ErrorHandlingMode::ResultUnknown => TYPED_ERROR_UNKNOWN_IMPL_TS,
                             ErrorHandlingMode::Throw | ErrorHandlingMode::Result => {
                                 TYPED_ERROR_IMPL_TS
                             }
@@ -53,7 +59,7 @@ impl LanguageExt for specta_typescript::JSDoc {
 
     fn export(self, cfg: &BuilderConfiguration, path: &Path) -> Result<(), Self::Error> {
         let cfg = cfg.clone();
-        let types = hide_unused_std_result_type(&cfg, cfg.types.clone());
+        let types = hide_ipc_standins(hide_unused_std_result_type(&cfg, cfg.types.clone()));
         let format = SpectaFormat::new(&cfg);
 
         Exporter::from(self)
@@ -66,6 +72,7 @@ impl LanguageExt for specta_typescript::JSDoc {
                     if cfg.typed_error_impl.is_empty() {
                         match cfg.error_handling {
                             ErrorHandlingMode::DataError => DATA_ERROR_IMPL_JS,
+                            ErrorHandlingMode::ResultUnknown => TYPED_ERROR_UNKNOWN_IMPL_JS,
                             ErrorHandlingMode::Throw | ErrorHandlingMode::Result => {
                                 TYPED_ERROR_IMPL_JS
                             }
@@ -93,6 +100,15 @@ fn runtime(
 ) -> Result<Cow<'static, str>, Error> {
     let enabled_commands = !cfg.commands.is_empty();
     let enabled_events = !cfg.events.is_empty();
+    let is_raw_request_used = cfg.commands.iter().any(|command| {
+        command
+            .args()
+            .iter()
+            .any(|(_, dt)| is_ipc_type(dt, exporter.types, "TAURI_REQUEST"))
+    });
+    // A builder with nothing registered has no commands to stub and no events to mock, so
+    // installing the IPC handler would only buy an import and an always-rejecting switch.
+    let enabled_mocks = cfg.mocks && (enabled_commands || enabled_events);
     let semantic_types_runtime_types = semantic_types_runtime_types(cfg)?;
     let semantic_types_runtime_types = semantic_types_runtime_types
         .as_ref()
@@ -106,18 +122,53 @@ fn runtime(
         .filter(|ndt| ndt.ty.is_some())
         .find_map(|ndt| {
             runtime_scope_name(jsdoc, exporter.layout, ndt)
-                .filter(|name| RESERVED_NDT_NAMES.contains(&name.as_ref()))
+                .filter(|name| {
+                    is_reserved_ndt_name(name, jsdoc, enabled_mocks)
+                        || (is_raw_request_used && name == "InvokeArgs")
+                        || (enabled_commands && name == "InvokeOptions")
+                })
                 .map(|name| (ndt, name))
         })
     {
         return Err(Error::framework(
-            "",
             format!(
                 "User defined type '{}' defined in {} must be renamed so it doesn't conflict with Tauri Specta runtime.",
                 name, ndt.location
             ),
+            "",
         ));
     }
+
+    {
+        // Two differently named commands can still produce one accessor (e.g. `my_cmd` and
+        // `MyCmd`), which silently keeps only the last. This has to run at export because
+        // the accessor depends on the final `function_casing`, which can be set after the
+        // commands were registered. Literal duplicates are rejected earlier, when they are
+        // registered (see `Builder::commands`).
+        let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+        for command in cfg.commands.iter() {
+            let accessor = cfg
+                .function_casing
+                .apply(cfg.command_accessor_name(command))
+                .into_owned();
+            if let Some(first) = seen.get(&accessor) {
+                return Err(Error::framework(
+                    format!(
+                        "Commands '{first}' and '{}' would both export as '{accessor}'. Rename one of them so the generated bindings don't conflict.",
+                        command.name()
+                    ),
+                    "",
+                ));
+            }
+            seen.insert(accessor, command.name());
+        }
+    }
+
+    // A `Channel` is only usable as a whole command argument or result. Anywhere else it
+    // renders as a bare reference name with no definition, so fail the export rather than
+    // emitting bindings that don't type-check. This runs for both the TypeScript and JSDoc
+    // exporters because it is part of the shared runtime path.
+    validate_channel_placement(cfg, exporter.types)?;
 
     let is_channel_used = cfg.commands.iter().any(|command| {
         // Check if any argument is a Channel
@@ -171,40 +222,87 @@ fn runtime(
 
         out.push_str(" } from \"@tauri-apps/api/core\";\n");
     }
+    if enabled_commands {
+        if jsdoc {
+            if is_raw_request_used {
+                out.push_str(
+                    "/** @typedef {import(\"@tauri-apps/api/core\").InvokeArgs} InvokeArgs */\n",
+                );
+            }
+            out.push_str(
+                "/** @typedef {import(\"@tauri-apps/api/core\").InvokeOptions} InvokeOptions */\n",
+            );
+        } else {
+            if is_raw_request_used {
+                out.push_str(
+                    "import type { InvokeArgs, InvokeOptions } from \"@tauri-apps/api/core\";\n",
+                );
+            } else {
+                out.push_str("import type { InvokeOptions } from \"@tauri-apps/api/core\";\n");
+            }
+        }
+    }
     if enabled_events {
         out.push_str("import * as __TAURI_EVENT from \"@tauri-apps/api/event\";\n");
+    }
+    if enabled_mocks {
+        out.push_str("import { mockIPC as __TAURI_MOCK_IPC } from \"@tauri-apps/api/mocks\";\n");
     }
 
     // Commands
     if enabled_commands {
         let mut s = Struct::named();
         for command in &cfg.commands {
-            let command_name_escaped =
-                serde_json::to_string(&resolve_tauri_command_name(cfg.plugin_name, command.name()))
-                    .expect("failed to serialize string");
-
-            let arguments = command
+            let raw_request = command
                 .args()
                 .iter()
-                .map(|(name, dt)| {
-                    Ok((
-                        name.to_lower_camel_case(),
-                        render_reference_dt_for_phase(
-                            dt,
-                            Phase::Deserialize,
-                            Phase::Serialize,
-                            &exporter,
-                            cfg,
-                            semantic_types_runtime_types,
-                        )?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
+                .any(|(_, dt)| is_ipc_type(dt, exporter.types, "TAURI_REQUEST"));
+            if raw_request && cfg.mocks {
+                return Err(Error::framework(
+                    command.name().to_string(),
+                    "raw IPC request commands are not supported by generated mocks",
+                ));
+            }
+            let command_name_escaped =
+                serde_json::to_string(&resolve_tauri_command_name(cfg.plugin_name, command.name()))
+                    .map_err(|err| {
+                        Error::framework("failed to serialize a command name for bindings", err)
+                    })?;
+
+            let mut arguments =
+                command_argument_types(command, &exporter, cfg, semantic_types_runtime_types)?;
+            let named_args = command
+                .args()
+                .iter()
+                .filter(|(_, dt)| !is_ipc_type(dt, exporter.types, "TAURI_REQUEST"))
+                .collect::<Vec<_>>();
+            let mixed_request = raw_request && !named_args.is_empty();
+            if mixed_request {
+                let fields = arguments
+                    .iter()
+                    .zip(command.args())
+                    .filter(|(_, (_, dt))| !is_ipc_type(dt, exporter.types, "TAURI_REQUEST"))
+                    .map(|((name, ty), _)| format!("{name}: {ty}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                arguments = vec![("value".into(), format!("{{ {fields} }}"))];
+            } else if raw_request {
+                arguments.truncate(1);
+            }
+            let mut options_name = "options".to_string();
+            while arguments.iter().any(|(name, _)| name == &options_name) {
+                options_name = format!("_{options_name}");
+            }
+            arguments.push((format!("{options_name}?"), "InvokeOptions".into()));
 
             let fn_arguments = arguments
                 .iter()
                 .map(|(name, dt)| {
-                    let mut arg = name.to_string();
+                    let mut arg = if jsdoc {
+                        name.trim_end_matches('?').to_string()
+                    } else {
+                        name.to_string()
+                    };
                     if !jsdoc {
                         arg.push_str(": ");
                         arg.push_str(dt);
@@ -214,11 +312,52 @@ fn runtime(
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            let arguments_invoke_obj = if command.args().is_empty() {
-                Default::default()
+            let arguments_invoke_obj = if mixed_request {
+                let fields = named_args
+                    .iter()
+                    .filter_map(|(name, dt)| {
+                        let name = name.to_lower_camel_case();
+                        let input = format!("value.{name}");
+                        let transform =
+                            if let Some(generic) = channel_generic_type(dt, exporter.types) {
+                                render_result_transform_for_phase(
+                                    generic,
+                                    Phase::Deserialize,
+                                    "v",
+                                    &exporter,
+                                    cfg,
+                                    semantic_types_runtime_types,
+                                )
+                                .map(|transform| jsdoc_transform(transform, "v", jsdoc))
+                                .map(|transform| format!("mapChannel({input}, (v) => {transform})"))
+                            } else {
+                                render_result_transform_for_phase(
+                                    dt,
+                                    Phase::Serialize,
+                                    &input,
+                                    &exporter,
+                                    cfg,
+                                    semantic_types_runtime_types,
+                                )
+                                .map(|transform| jsdoc_transform(transform, &input, jsdoc))
+                            };
+                        transform.map(|transform| format!("{name}: {transform}"))
+                    })
+                    .collect::<Vec<_>>();
+                let value = if fields.is_empty() {
+                    "value".to_string()
+                } else {
+                    format!("{{ ...value, {} }}", fields.join(", "))
+                };
+                format!(", {value}, {options_name}")
+            } else if raw_request {
+                let name = &arguments[0].0;
+                format!(", Array.isArray({name}) ? new Uint8Array({name}) : {name}, {options_name}")
+            } else if command.args().is_empty() {
+                format!(", undefined, {options_name}")
             } else {
                 format!(
-                    ", {{ {} }}",
+                    ", {{ {} }}, {options_name}",
                     command
                         .args()
                         .iter()
@@ -307,15 +446,24 @@ fn runtime(
                     semantic_types_runtime_types,
                 )
                 .map(|transform| jsdoc_transform(transform, "v.data", jsdoc));
+                // `ResultUnknown` declares the error as `unknown`, so the transform must
+                // accept whatever the rejection was. Widen the input so a transform written
+                // against the command's error type still type-checks; the runtime value is
+                // unchanged.
+                let err_input = if cfg.error_handling == ErrorHandlingMode::ResultUnknown {
+                    "(v.error as any)"
+                } else {
+                    "v.error"
+                };
                 let err_transform = render_result_transform_for_phase(
                     dt_err,
                     Phase::Deserialize,
-                    "v.error",
+                    err_input,
                     &exporter,
                     cfg,
                     semantic_types_runtime_types,
                 )
-                .map(|transform| jsdoc_transform(transform, "v.error", jsdoc));
+                .map(|transform| jsdoc_transform(transform, err_input, jsdoc));
 
                 let mut invoke_ts = "typedError".to_string();
                 if !jsdoc {
@@ -436,7 +584,13 @@ fn runtime(
                     docs.push_str(
                         &arguments
                             .iter()
-                            .map(|(name, dt)| format!("@param {{{dt}}} {name}"))
+                            .map(|(name, dt)| {
+                                if let Some(name) = name.strip_suffix('?') {
+                                    format!("@param {{{dt}}} [{name}]")
+                                } else {
+                                    format!("@param {{{dt}}} {name}")
+                                }
+                            })
                             .collect::<Vec<_>>()
                             .join("\n"),
                     );
@@ -530,7 +684,9 @@ fn runtime(
                 docs.into()
             };
             s = s.field(
-                cfg.function_casing.apply(command.name()).into_owned(),
+                cfg.function_casing
+                    .apply(cfg.command_accessor_name(command))
+                    .into_owned(),
                 field,
             );
         }
@@ -546,8 +702,9 @@ fn runtime(
         let mut s = Struct::named();
         for (name, (_, r)) in &cfg.events {
             let event_name_escaped =
-                serde_json::to_string(&resolve_tauri_event_name(cfg.plugin_name, name))
-                    .expect("failed to serialize string");
+                serde_json::to_string(&resolve_tauri_event_name(cfg.plugin_name, name)).map_err(
+                    |err| Error::framework("failed to serialize an event name for bindings", err),
+                )?;
 
             let event_dt = DataType::Reference(r.clone());
             let mut field_ts = "makeEvent".to_string();
@@ -658,7 +815,7 @@ fn runtime(
             out.push_str(" = ");
             out.push_str(
                 &serde_json::to_string(&value)
-                    .expect("failed to serialize from `serde_json::Value`"),
+                    .map_err(|err| Error::framework("failed to serialize a constant", err))?,
             );
             out.push_str(as_constt.unwrap_or(""));
             out.push_str(";\n");
@@ -706,7 +863,344 @@ fn runtime(
         }
     }
 
+    // Mocks
+    if enabled_mocks {
+        out.push_str("\n/* Tauri Specta mocks */\n\n");
+        out.push_str(&mock_handlers_declaration(
+            cfg,
+            &exporter,
+            semantic_types_runtime_types,
+            jsdoc,
+        )?);
+        out.push('\n');
+        out.push_str(&mock_commands_impl(cfg, jsdoc)?);
+        if enabled_commands {
+            out.push('\n');
+            out.push_str(if jsdoc {
+                MOCK_COMMAND_HANDLER_IMPL_JS
+            } else {
+                MOCK_COMMAND_HANDLER_IMPL_TS
+            });
+            out.push('\n');
+        }
+    }
+
+    // Single-file layouts get one newline appended after the framework runtime by the
+    // exporter, so ending our body with a newline too would leave a blank line at the end
+    // of the file. The `Files` layout writes this runtime into its own file without that
+    // appended newline, so it keeps ours.
+    if exporter.layout != Layout::Files {
+        while out.ends_with('\n') {
+            out.pop();
+        }
+    }
+
     Ok(Cow::Owned(out))
+}
+
+/// A command accessor as it should appear as an object key.
+///
+/// Accessors are usually plain identifiers, but [`Casing::KebabCase`](crate::Casing)
+/// produces keys like `hello-world`, which have to be quoted. This is the same rule
+/// `specta_typescript` applies to struct field names.
+fn js_object_key(accessor: &str) -> Result<String, Error> {
+    if is_js_identifier(accessor) {
+        Ok(accessor.to_string())
+    } else {
+        serde_json::to_string(accessor)
+            .map_err(|err| Error::framework("failed to serialize a command accessor", err))
+    }
+}
+
+/// A read of `object`'s [`js_object_key`] property named `accessor`.
+fn js_member_access(object: &str, accessor: &str) -> Result<String, Error> {
+    if is_js_identifier(accessor) {
+        Ok(format!("{object}.{accessor}"))
+    } else {
+        Ok(format!(
+            "{object}[{}]",
+            serde_json::to_string(accessor)
+                .map_err(|err| Error::framework("failed to serialize a command accessor", err))?
+        ))
+    }
+}
+
+fn is_js_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+}
+
+/// The `MockCommandHandlers` type, listing one handler per generated command.
+///
+/// Handlers are keyed by command accessor (the name under `commands.*`) rather than the
+/// Tauri command name, so `#[tauri::command(rename = "...")]` doesn't leak into the
+/// frontend-facing API here any more than it does for `commands` itself.
+fn mock_handlers_declaration(
+    cfg: &BuilderConfiguration,
+    exporter: &FrameworkExporter,
+    semantic_types_runtime_types: &Types,
+    jsdoc: bool,
+) -> Result<String, Error> {
+    let mut handlers = Vec::new();
+
+    for command in cfg.commands.iter() {
+        let key = js_object_key(
+            &cfg.function_casing
+                .apply(cfg.command_accessor_name(command)),
+        )?;
+        let (arguments, result) =
+            mock_handler_signature(command, exporter, cfg, semantic_types_runtime_types)?;
+        handlers.push(format!(
+            "{key}: {arguments} => {result} | Promise<{result}>,"
+        ));
+    }
+
+    let mut out = String::new();
+
+    // JSDoc gets one object literal rather than an `@property` per command: an
+    // `@property` name has to be an identifier, which `Casing::KebabCase` accessors
+    // aren't.
+    if jsdoc {
+        out.push_str("/**\n * @typedef {{\n");
+        for handler in &handlers {
+            out.push_str(&format!(" *     {handler}\n"));
+        }
+        out.push_str(" * }} MockCommandHandlers\n */\n");
+    } else {
+        out.push_str(
+            "/** A handler for each generated command, keyed by its `commands` accessor. */\n",
+        );
+        out.push_str("export type MockCommandHandlers = {\n");
+        for handler in &handlers {
+            out.push_str(&format!("    {handler}\n"));
+        }
+        out.push_str("};\n");
+    }
+
+    Ok(out)
+}
+
+/// The frontend-facing name and type of each of a command's arguments.
+///
+/// This is what the generated `commands` accessor declares and what its IPC payload uses,
+/// so anything else describing the same command — mock handlers, for instance — is
+/// written in exactly these terms.
+fn command_argument_types(
+    command: &Function,
+    exporter: &FrameworkExporter,
+    cfg: &BuilderConfiguration,
+    semantic_types_runtime_types: &Types,
+) -> Result<Vec<(String, String)>, Error> {
+    command
+        .args()
+        .iter()
+        .map(|(name, dt)| {
+            Ok((
+                name.to_lower_camel_case(),
+                render_reference_dt_for_phase(
+                    dt,
+                    Phase::Deserialize,
+                    Phase::Serialize,
+                    exporter,
+                    cfg,
+                    semantic_types_runtime_types,
+                )?,
+            ))
+        })
+        .collect()
+}
+
+/// The `(arguments, result)` signature of one command's mock handler.
+///
+/// This mirrors how `commands` types the same command, so a handler is written in the
+/// same terms as the call it stands in for, rather than in terms of the IPC payload.
+fn mock_handler_signature(
+    command: &Function,
+    exporter: &FrameworkExporter,
+    cfg: &BuilderConfiguration,
+    semantic_types_runtime_types: &Types,
+) -> Result<(String, String), Error> {
+    validate_mock_transforms(command, exporter, cfg, semantic_types_runtime_types)?;
+
+    let arguments = command_argument_types(command, exporter, cfg, semantic_types_runtime_types)?;
+
+    let arguments = if arguments.is_empty() {
+        "()".to_string()
+    } else {
+        format!(
+            "(args: {{ {} }})",
+            arguments
+                .iter()
+                .map(|(name, dt)| format!("{name}: {dt}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    };
+
+    // A handler returns the command's success value: for a `Result`, that is the `Ok`
+    // side, since a mock fails a command by throwing rather than by returning `Err`.
+    let result = match command
+        .result()
+        .and_then(|dt| extract_std_result(dt, exporter.types).map(|(ok, _)| ok))
+        .or(command.result())
+    {
+        Some(dt) => {
+            let result_semantic_type = has_semantic_type_for_phase(
+                dt,
+                Phase::Deserialize,
+                "v",
+                exporter,
+                cfg,
+                semantic_types_runtime_types,
+            );
+            render_reference_dt_for_phase(
+                dt,
+                if result_semantic_type {
+                    Phase::Deserialize
+                } else {
+                    Phase::Serialize
+                },
+                Phase::Deserialize,
+                exporter,
+                cfg,
+                semantic_types_runtime_types,
+            )?
+        }
+        None => "void".to_string(),
+    };
+
+    Ok((arguments, result))
+}
+
+/// Rejects a command whose mock handler could not be typed honestly.
+///
+/// A [`semantic`](specta_typescript::semantic) rule can give a value one type in the
+/// generated bindings and another on the wire, applying a transform in between (a struct
+/// field of a rule-backed type is enough — a bare argument does not get one). A mock
+/// handler sits on the wire side of that transform, so the type it declares would be a
+/// lie, and the transform's output type can't be recovered from the rule. Fail the export
+/// rather than emit a binding that lies, like the other export-time validations do.
+fn validate_mock_transforms(
+    command: &Function,
+    exporter: &FrameworkExporter,
+    cfg: &BuilderConfiguration,
+    semantic_types_runtime_types: &Types,
+) -> Result<(), Error> {
+    let reject = |dt: &DataType, phase: Phase, subject: &str| {
+        if render_result_transform_for_phase(
+            dt,
+            phase,
+            "v",
+            exporter,
+            cfg,
+            semantic_types_runtime_types,
+        )
+        .is_some()
+        {
+            return Err(Error::framework(
+                format!(
+                    "`Builder::mocks` can't type a mock for command '{}': {subject} is reshaped by a semantic type transform, so the handler wouldn't receive or return the type it declares. Export the mocks without `Builder::semantic_types`, or drop `Builder::mocks`.",
+                    command.name()
+                ),
+                "",
+            ));
+        }
+
+        Ok(())
+    };
+
+    for (name, dt) in command.args() {
+        // A channel's payload is transformed as messages arrive, so either way the handler
+        // sees the `Channel<T>` it declares.
+        if channel_generic_type(dt, exporter.types).is_some() {
+            continue;
+        }
+
+        reject(dt, Phase::Serialize, &format!("argument '{name}'"))?;
+    }
+
+    if let Some(result) = command.result() {
+        let (ok, err) = extract_std_result(result, exporter.types)
+            .map_or((result, None), |(ok, err)| (ok, Some(err)));
+
+        reject(ok, Phase::Deserialize, "the result")?;
+
+        // A `Throw` mode failure is passed through as-is, so only a mode that wraps the
+        // error goes through a transform.
+        if let Some(err) = err
+            && cfg.error_handling != ErrorHandlingMode::Throw
+        {
+            reject(err, Phase::Deserialize, "the error")?;
+        }
+    }
+
+    Ok(())
+}
+
+/// The `mockCommands` installer, which routes each registered Tauri command name to its
+/// handler.
+fn mock_commands_impl(cfg: &BuilderConfiguration, jsdoc: bool) -> Result<String, Error> {
+    let mut out = String::new();
+    out.push_str(MOCK_COMMANDS_DOC);
+    if jsdoc {
+        out.push_str("\n *\n * @param {Partial<MockCommandHandlers>} [handlers]");
+    }
+    out.push_str("\n */\n");
+
+    if jsdoc {
+        out.push_str("export function mockCommands(handlers = {}) {\n");
+    } else {
+        out.push_str(
+            "export function mockCommands(handlers: Partial<MockCommandHandlers> = {}): void {\n",
+        );
+    }
+    out.push_str(if jsdoc {
+        MOCK_HANDLER_REGISTRY_IMPL_JS
+    } else {
+        MOCK_HANDLER_REGISTRY_IMPL_TS
+    });
+
+    // An events-only builder never reads `args`, which `noUnusedParameters` (set by every
+    // tsconfig in this repo's examples) would reject.
+    let callback_args = if cfg.commands.is_empty() {
+        "_args"
+    } else {
+        "args"
+    };
+    out.push_str(&format!(
+        "    return __TAURI_MOCK_IPC((cmd, {callback_args}) => {{\n"
+    ));
+    out.push_str("        switch (cmd) {\n");
+
+    for command in cfg.commands.iter() {
+        let accessor = cfg
+            .function_casing
+            .apply(cfg.command_accessor_name(command))
+            .into_owned();
+        let access = js_member_access("mockHandlers", &accessor)?;
+        let command_name =
+            serde_json::to_string(&resolve_tauri_command_name(cfg.plugin_name, command.name()))
+                .map_err(|err| {
+                    Error::framework("failed to serialize a command name for bindings", err)
+                })?;
+        out.push_str(&format!(
+            "            case {command_name}: return mockCommandHandler({access}, {command_name}, args);\n"
+        ));
+    }
+
+    out.push_str(
+        "            default: throw new Error(`No mock handler registered for command '${cmd}'`);\n",
+    );
+    out.push_str("        }\n");
+    out.push_str("    }, { shouldMockEvents: true });\n");
+    out.push_str("}\n");
+
+    Ok(out)
 }
 
 fn runtime_scope_name(
@@ -989,6 +1483,31 @@ fn is_result_ndt(ndt: &NamedDataType) -> bool {
     ndt.name == "Result" && matches!(&*ndt.module_path, "std::result" | "core::result")
 }
 
+/// Whether `ndt` is the stand-in Tauri derives for `tauri::ipc::Channel`.
+fn is_channel_ndt(ndt: &NamedDataType) -> bool {
+    ndt.name == "TAURI_CHANNEL" && ndt.module_path.starts_with("tauri::")
+}
+
+fn is_ipc_type(dt: &DataType, types: &Types, name: &str) -> bool {
+    let DataType::Reference(Reference::Named(reference)) = dt else {
+        return false;
+    };
+    types
+        .get(reference)
+        .is_some_and(|ndt| ndt.name == name && ndt.module_path.starts_with("tauri::"))
+}
+
+fn hide_ipc_standins(mut types: Types) -> Types {
+    types.iter_mut(|ndt| {
+        if matches!(ndt.name.as_ref(), "TAURI_REQUEST" | "TAURI_RESPONSE")
+            && ndt.module_path.starts_with("tauri::")
+        {
+            ndt.ty = None;
+        }
+    });
+    types
+}
+
 fn is_channel_type(dt: &DataType, types: &Types) -> bool {
     channel_generic_type(dt, types).is_some()
 }
@@ -998,13 +1517,186 @@ fn channel_generic_type<'a>(dt: &'a DataType, types: &Types) -> Option<&'a DataT
         return None;
     };
     let ndt = types.get(r)?;
-    if ndt.name != "TAURI_CHANNEL" || !ndt.module_path.starts_with("tauri::") {
+    if !is_channel_ndt(ndt) {
         return None;
     }
     match &r.inner {
         NamedReferenceType::Reference { generics, .. } => generics.first().map(|(_, dt)| dt),
         NamedReferenceType::Inline { .. } | NamedReferenceType::Recursive(_) => None,
     }
+}
+
+/// Where a `Channel` was found in a position Tauri can't use it.
+enum ChannelSite<'a> {
+    /// The channel is nested in this named type's definition.
+    NamedType(&'a NamedDataType),
+    /// The channel is nested in a command or event signature without an intervening
+    /// named type.
+    Signature,
+}
+
+/// Walk `dt` looking for a `Channel` reference that is not the root datatype.
+///
+/// Named references are resolved through `types` so a channel reached through another
+/// struct or alias is caught. `owner` is the named type whose body is being walked, so the
+/// error can point at it. `visited` holds the addresses of named type bodies that were
+/// already walked, which keeps recursive type definitions finite.
+fn find_nested_channel<'a>(
+    dt: &DataType,
+    types: &'a Types,
+    owner: Option<&'a NamedDataType>,
+    visited: &mut BTreeSet<usize>,
+) -> Option<ChannelSite<'a>> {
+    match dt {
+        DataType::Primitive(_) | DataType::Generic(_) => None,
+        DataType::List(list) => find_nested_channel(&list.ty, types, owner, visited),
+        DataType::Map(map) => find_nested_channel(map.key_ty(), types, owner, visited)
+            .or_else(|| find_nested_channel(map.value_ty(), types, owner, visited)),
+        DataType::Struct(s) => fields_nested_channel(&s.fields, types, owner, visited),
+        DataType::Enum(e) => e
+            .variants
+            .iter()
+            .find_map(|(_, variant)| fields_nested_channel(&variant.fields, types, owner, visited)),
+        DataType::Tuple(tuple) => tuple
+            .elements
+            .iter()
+            .find_map(|dt| find_nested_channel(dt, types, owner, visited)),
+        DataType::Nullable(dt) => find_nested_channel(dt, types, owner, visited),
+        DataType::Intersection(parts) => parts
+            .iter()
+            .find_map(|dt| find_nested_channel(dt, types, owner, visited)),
+        DataType::Reference(Reference::Opaque(_)) => None,
+        DataType::Reference(Reference::Named(r)) => {
+            let ndt = types.get(r)?;
+            if is_channel_ndt(ndt) {
+                return Some(owner.map_or(ChannelSite::Signature, ChannelSite::NamedType));
+            }
+
+            match &r.inner {
+                NamedReferenceType::Recursive(_) => None,
+                NamedReferenceType::Inline { dt, .. } => {
+                    find_nested_channel(dt, types, owner, visited)
+                }
+                NamedReferenceType::Reference { generics, .. } => generics
+                    .iter()
+                    .find_map(|(_, dt)| find_nested_channel(dt, types, owner, visited))
+                    .or_else(|| nested_channel_in_named_type(ndt, types, visited)),
+            }
+        }
+    }
+}
+
+/// Walk a named type's body for a nested channel, skipping bodies that were already seen.
+fn nested_channel_in_named_type<'a>(
+    ndt: &'a NamedDataType,
+    types: &'a Types,
+    visited: &mut BTreeSet<usize>,
+) -> Option<ChannelSite<'a>> {
+    let body = ndt.ty.as_ref()?;
+    if !visited.insert(std::ptr::from_ref(ndt).addr()) {
+        return None;
+    }
+    find_nested_channel(body, types, Some(ndt), visited)
+}
+
+fn fields_nested_channel<'a>(
+    fields: &Fields,
+    types: &'a Types,
+    owner: Option<&'a NamedDataType>,
+    visited: &mut BTreeSet<usize>,
+) -> Option<ChannelSite<'a>> {
+    match fields {
+        Fields::Unit => None,
+        Fields::Unnamed(fields) => fields
+            .fields
+            .iter()
+            .filter_map(|field| field.ty.as_ref())
+            .find_map(|dt| find_nested_channel(dt, types, owner, visited)),
+        Fields::Named(fields) => fields
+            .fields
+            .iter()
+            .filter_map(|(_, field)| field.ty.as_ref())
+            .find_map(|dt| find_nested_channel(dt, types, owner, visited)),
+    }
+}
+
+/// Reject `Channel`s that aren't the whole command argument or result.
+fn validate_channel_placement(cfg: &BuilderConfiguration, types: &Types) -> Result<(), Error> {
+    // Covers events, `Builder::typ`, and command results that are named types: a channel
+    // anywhere in a definition renders as an undefined reference name.
+    for ndt in types.into_unsorted_iter() {
+        let mut visited = BTreeSet::new();
+        if let Some(site) = nested_channel_in_named_type(ndt, types, &mut visited) {
+            return Err(channel_nested_error(site, ""));
+        }
+    }
+
+    for command in cfg.commands.iter() {
+        for (name, dt) in command.args() {
+            validate_channel_signature_datatype(
+                dt,
+                types,
+                &format!("argument '{name}' of command '{}'", command.name()),
+            )?;
+        }
+        if let Some(dt) = command.result() {
+            validate_channel_signature_datatype(
+                dt,
+                types,
+                &format!("the result of command '{}'", command.name()),
+            )?;
+        }
+    }
+
+    // Event payloads are exported as plain types, so a channel at their root is just as
+    // invalid as a channel nested in one.
+    for (name, (_, reference)) in cfg.events.iter() {
+        validate_channel_signature_datatype(
+            &DataType::Reference(reference.clone()),
+            types,
+            &format!("event '{name}'"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_channel_signature_datatype(
+    dt: &DataType,
+    types: &Types,
+    subject: &str,
+) -> Result<(), Error> {
+    // A channel is allowed as the whole argument or result, but its payload is plain
+    // serialized data so a channel can't hide in there either.
+    if let Some(payload) = channel_generic_type(dt, types) {
+        let mut visited = BTreeSet::new();
+        if let Some(site) = find_nested_channel(payload, types, None, &mut visited) {
+            return Err(channel_nested_error(site, subject));
+        }
+        return Ok(());
+    }
+
+    let mut visited = BTreeSet::new();
+    match find_nested_channel(dt, types, None, &mut visited) {
+        Some(site) => Err(channel_nested_error(site, subject)),
+        None => Ok(()),
+    }
+}
+
+fn channel_nested_error(site: ChannelSite<'_>, signature_subject: &str) -> Error {
+    let subject = match site {
+        ChannelSite::NamedType(ndt) => {
+            format!("type '{}' defined in {}", ndt.name, ndt.location)
+        }
+        ChannelSite::Signature => signature_subject.to_string(),
+    };
+
+    Error::framework(
+        format!(
+            "`tauri::ipc::Channel` is nested inside {subject}. A channel must be a direct command argument (or the whole command result), so move it to the top level. To send a channel id inside a payload, use `tauri::ipc::JavaScriptChannelId` and resolve it with `channel_on` instead."
+        ),
+        "",
+    )
 }
 
 fn render_result_transform_for_phase(
@@ -1043,13 +1735,15 @@ fn result_mapper(
     err_transform: Option<String>,
 ) -> String {
     match (mode, ok_transform, err_transform) {
-        (ErrorHandlingMode::Result, Some(ok), Some(err)) => format!(
-            "(v.status === \"ok\" ? {{ ...v, data: {ok} }} : v.status === \"error\" ? {{ ...v, error: {err} }} : v)"
-        ),
-        (ErrorHandlingMode::Result, Some(ok), None) => {
+        (ErrorHandlingMode::Result | ErrorHandlingMode::ResultUnknown, Some(ok), Some(err)) => {
+            format!(
+                "(v.status === \"ok\" ? {{ ...v, data: {ok} }} : v.status === \"error\" ? {{ ...v, error: {err} }} : v)"
+            )
+        }
+        (ErrorHandlingMode::Result | ErrorHandlingMode::ResultUnknown, Some(ok), None) => {
             format!("(v.status === \"ok\" ? {{ ...v, data: {ok} }} : v)")
         }
-        (ErrorHandlingMode::Result, None, Some(err)) => {
+        (ErrorHandlingMode::Result | ErrorHandlingMode::ResultUnknown, None, Some(err)) => {
             format!("(v.status === \"error\" ? {{ ...v, error: {err} }} : v)")
         }
         (ErrorHandlingMode::DataError, Some(ok), Some(err)) => {
@@ -1070,6 +1764,9 @@ fn result_type(mode: ErrorHandlingMode, ok: &str, err: &str) -> String {
         ErrorHandlingMode::Throw => ok.to_string(),
         ErrorHandlingMode::Result => {
             format!("{{ status: \"ok\"; data: {ok} }} | {{ status: \"error\"; error: {err} }}")
+        }
+        ErrorHandlingMode::ResultUnknown => {
+            format!("{{ status: \"ok\"; data: {ok} }} | {{ status: \"error\"; error: unknown }}")
         }
         ErrorHandlingMode::DataError => {
             format!("{{ data: {ok}; error: null }} | {{ data: null; error: {err} }}")
@@ -1143,10 +1840,15 @@ fn semantic_types_runtime_types(cfg: &BuilderConfiguration) -> Result<Option<Typ
 // Render a `DataType` as a reference (or fallback to inline).
 // Also handles Tauri channel references.
 fn render_reference_dt(dt: &DataType, exporter: &FrameworkExporter) -> Result<String, Error> {
+    if is_ipc_type(dt, exporter.types, "TAURI_REQUEST") {
+        return Ok("InvokeArgs".into());
+    }
+    if is_ipc_type(dt, exporter.types, "TAURI_RESPONSE") {
+        return Ok("unknown".into());
+    }
     if let DataType::Reference(Reference::Named(r)) = dt
         && let Some(ndt) = exporter.types.get(r)
-        && ndt.name == "TAURI_CHANNEL"
-        && ndt.module_path.starts_with("tauri::")
+        && is_channel_ndt(ndt)
     {
         let generics = match &r.inner {
             NamedReferenceType::Reference { generics, .. } => generics.as_slice(),
@@ -1172,6 +1874,26 @@ const RESERVED_NDT_NAMES: &[&str] = &[
     "mapChannel",
 ];
 
+/// Names only the mocks runtime declares, and so only reserved on an export that
+/// [`Builder::mocks`](crate::Builder::mocks) actually emits them for.
+const RESERVED_NDT_NAMES_MOCKS_ONLY: &[&str] = &[
+    "__TAURI_MOCK_IPC",
+    "MockCommandHandlers",
+    "mockCommandHandler",
+    "mockCommands",
+];
+
+/// Names only the TypeScript runtime declares. The JSDoc runtime has no
+/// corresponding typedefs, so user types may use them there (and a JSDoc export
+/// must not fail over a name it never emits).
+const RESERVED_NDT_NAMES_TS_ONLY: &[&str] = &["EventEmit", "EventEmitTo"];
+
+fn is_reserved_ndt_name(name: &str, jsdoc: bool, mocks: bool) -> bool {
+    RESERVED_NDT_NAMES.contains(&name)
+        || (!jsdoc && RESERVED_NDT_NAMES_TS_ONLY.contains(&name))
+        || (mocks && RESERVED_NDT_NAMES_MOCKS_ONLY.contains(&name))
+}
+
 const FRAMEWORK_HEADER: &str =
     "// This file has been generated by Tauri Specta. Do not edit this file manually.";
 
@@ -1181,6 +1903,14 @@ const TYPED_ERROR_IMPL_TS: &str = r#"async function typedError<T, E>(result: Pro
     } catch (e) {
         if (e instanceof Error) throw e;
         return { status: "error", error: e as any };
+    }
+}"#;
+
+const TYPED_ERROR_UNKNOWN_IMPL_TS: &str = r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: unknown }> {
+    try {
+        return { status: "ok", data: await result };
+    } catch (e) {
+        return { status: "error", error: e };
     }
 }"#;
 
@@ -1222,6 +1952,20 @@ async function typedError(result) {
     }
 }"#;
 
+const TYPED_ERROR_UNKNOWN_IMPL_JS: &str = r#"/**
+  * @template T
+  * @template E
+  * @param {Promise<T>} result
+  * @returns {Promise<{ status: "ok"; data: T } | { status: "error"; error: unknown }>}
+  */
+async function typedError(result) {
+    try {
+        return { status: "ok", data: await result };
+    } catch (e) {
+        return { status: "error", error: e };
+    }
+}"#;
+
 const DATA_ERROR_IMPL_JS: &str = r#"/**
   * @template T
   * @template E
@@ -1239,7 +1983,56 @@ async function typedError(result) {
 
 const TYPED_ERROR_ASSERTION_TS: &str = "const _assertTypedErrorFollowsContract: <T, E>(result: Promise<T>) => Promise<any> = typedError;";
 
+const MOCK_COMMANDS_DOC: &str = r#"/**
+ * Install typed mock handlers for the generated commands.
+ *
+ * Handlers are installed through `@tauri-apps/api/mocks`'s `mockIPC`, so the application
+ * under test keeps importing the real `commands` object and still runs the argument and
+ * result transforms around each call.
+ *
+ * A handler receives the command's arguments and returns its success value; throw (or
+ * return a rejected promise) to make the command fail. A command with no handler rejects
+ * with an error rather than resolving `undefined`, so a test can't pass by accident.
+ *
+ * Tauri's event mocking is enabled as part of the install (`shouldMockEvents`), so
+ * `events` keeps working under test without a second installer fighting this one. Note
+ * that Tauri's own mock does not implement `emitTo`, which resolves without reaching any
+ * listener. Call `clearMocks` from `@tauri-apps/api/mocks` between tests."#;
+
+const MOCK_HANDLER_REGISTRY_IMPL_TS: &str = r#"    // A copy with no prototype, so a command named after an `Object.prototype` member
+    // (`toString`, `constructor`, …) reports that it is unregistered instead of calling
+    // whatever the prototype happens to provide.
+    const mockHandlers: Partial<MockCommandHandlers> = Object.create(null);
+    Object.assign(mockHandlers, handlers);
+"#;
+
+const MOCK_HANDLER_REGISTRY_IMPL_JS: &str = r#"    // A copy with no prototype, so a command named after an `Object.prototype` member
+    // (`toString`, `constructor`, …) reports that it is unregistered instead of calling
+    // whatever the prototype happens to provide.
+    /** @type {Partial<MockCommandHandlers>} */
+    const mockHandlers = Object.create(null);
+    Object.assign(mockHandlers, handlers);
+"#;
+
+const MOCK_COMMAND_HANDLER_IMPL_TS: &str = r#"function mockCommandHandler(handler: ((args: any) => unknown) | undefined, name: string, args: unknown): unknown {
+    if (handler === undefined) throw new Error(`No mock handler registered for command '${name}'`);
+    return handler(args);
+}"#;
+
+const MOCK_COMMAND_HANDLER_IMPL_JS: &str = r#"/**
+ * @param {((args: any) => unknown) | undefined} handler
+ * @param {string} name
+ * @param {unknown} args
+ * @returns {unknown}
+ */
+function mockCommandHandler(handler, name, args) {
+    if (handler === undefined) throw new Error(`No mock handler registered for command '${name}'`);
+    return handler(args);
+}"#;
+
 const MAKE_EVENT_IMPL_TS: &str = r#"type EventEmit<T> = [T] extends [null] ? () => Promise<void> : (payload: T) => Promise<void>;
+
+type EventEmitTo<T> = [T] extends [null] ? (target: __TAURI_EVENT.EventTarget | string) => Promise<void> : (target: __TAURI_EVENT.EventTarget | string, payload: T) => Promise<void>;
 
 function makeEvent<TListen, TEmit = TListen>(name: string, serialize?: (payload: TEmit) => unknown, deserialize?: (payload: any) => TListen) {
     const mapEvent = (cb: __TAURI_EVENT.EventCallback<TListen>) => (event: __TAURI_EVENT.Event<any>) => cb({ ...event, payload: deserialize ? deserialize(event.payload) : event.payload });
@@ -1248,13 +2041,15 @@ function makeEvent<TListen, TEmit = TListen>(name: string, serialize?: (payload:
     const base = {
         listen: (cb: __TAURI_EVENT.EventCallback<TListen>) => __TAURI_EVENT.listen(name, mapEvent(cb)),
         once: (cb: __TAURI_EVENT.EventCallback<TListen>) => __TAURI_EVENT.once(name, mapEvent(cb)),
-        emit: ((payload: TEmit) => __TAURI_EVENT.emit(name, mapPayload(payload)) as unknown) as EventEmit<TEmit>
+        emit: ((payload: TEmit) => __TAURI_EVENT.emit(name, mapPayload(payload)) as unknown) as EventEmit<TEmit>,
+        emitTo: ((to: __TAURI_EVENT.EventTarget | string, payload: TEmit) => __TAURI_EVENT.emitTo(to, name, mapPayload(payload)) as unknown) as EventEmitTo<TEmit>
     };
 
     const fn = (target: import("@tauri-apps/api/webview").Webview | import("@tauri-apps/api/window").Window) => ({
         listen: (cb: __TAURI_EVENT.EventCallback<TListen>) => target.listen(name, mapEvent(cb)),
         once: (cb: __TAURI_EVENT.EventCallback<TListen>) => target.once(name, mapEvent(cb)),
-        emit: ((payload: TEmit) => target.emit(name, mapPayload(payload)) as unknown) as EventEmit<TEmit>
+        emit: ((payload: TEmit) => target.emit(name, mapPayload(payload)) as unknown) as EventEmit<TEmit>,
+        emitTo: ((to: __TAURI_EVENT.EventTarget | string, payload: TEmit) => target.emitTo(to, name, mapPayload(payload)) as unknown) as EventEmitTo<TEmit>
     });
 
     return Object.assign(fn, base);
@@ -1277,6 +2072,11 @@ function makeEvent(name, serialize, deserialize) {
         once: (cb) => __TAURI_EVENT.once(name, mapEvent(cb)),
         /** @param {T} payload */
         emit: (payload) => __TAURI_EVENT.emit(name, mapPayload(payload)),
+        /**
+         * @param {__TAURI_EVENT.EventTarget | string} to
+         * @param {T} payload
+         */
+        emitTo: (to, payload) => __TAURI_EVENT.emitTo(to, name, mapPayload(payload)),
     };
 
     /** @param {import("@tauri-apps/api/webview").Webview | import("@tauri-apps/api/window").Window} target */
@@ -1287,6 +2087,11 @@ function makeEvent(name, serialize, deserialize) {
         once: (cb) => target.once(name, mapEvent(cb)),
         /** @param {T} payload */
         emit: (payload) => target.emit(name, mapPayload(payload)),
+        /**
+         * @param {__TAURI_EVENT.EventTarget | string} to
+         * @param {T} payload
+         */
+        emitTo: (to, payload) => target.emitTo(to, name, mapPayload(payload)),
     });
 
     return Object.assign(fn, base);
@@ -1302,7 +2107,7 @@ mod tests {
         datatype::{DataType, Primitive},
         specta,
     };
-    use specta_typescript::{JSDoc, Layout, Typescript};
+    use specta_typescript::{JSDoc, Layout, Typescript, define, semantic};
 
     use crate::{Builder, ErrorHandlingMode, collect_commands};
 
@@ -1342,6 +2147,41 @@ mod tests {
         pub enum Channel {
             Production,
         }
+    }
+
+    /// A user type named after something the mocks runtime declares.
+    mod mock_names {
+        use super::*;
+
+        #[derive(Serialize, Deserialize, Type)]
+        #[allow(dead_code)]
+        pub struct MockCommandHandlers {
+            value: String,
+        }
+    }
+
+    /// Mirrors the built-in `bytes::Bytes` semantic rule, which transforms in both
+    /// directions.
+    #[derive(Serialize, Deserialize, Type)]
+    struct SemanticBytes(Vec<u8>);
+
+    #[derive(Serialize, Deserialize, Type)]
+    struct NestedSemanticBytes {
+        value: SemanticBytes,
+    }
+
+    #[tauri::command]
+    #[specta]
+    fn nested_semantic_bytes(input: NestedSemanticBytes) -> NestedSemanticBytes {
+        input
+    }
+
+    fn semantic_bytes() -> semantic::Configuration {
+        semantic::Configuration::empty().define::<SemanticBytes>(
+            |_| define("Uint8Array").into(),
+            Some(semantic::Transform::new(|i| format!("[...{i}]"))),
+            Some(semantic::Transform::new(|i| format!("new Uint8Array({i})"))),
+        )
     }
 
     mod inline {
@@ -1392,12 +2232,18 @@ mod tests {
         Ok(String::new())
     }
 
+    #[tauri::command]
+    #[specta]
+    fn bigint_error() -> Result<String, u64> {
+        Ok(String::new())
+    }
+
     #[test]
     fn reserved_runtime_names_use_exported_type_names() {
         let output_dir = std::path::Path::new("target/tests/reserved-runtime-names");
         let _ = fs::remove_dir_all(output_dir);
 
-        let renamed = Builder::<tauri::Wry>::new().typ::<Channel>();
+        let renamed = Builder::<tauri::DynRuntime>::new().typ::<Channel>();
         for (name, layout) in [
             ("flat", Layout::FlatFile),
             ("namespaces", Layout::Namespaces),
@@ -1430,7 +2276,7 @@ mod tests {
         );
 
         let inline_path = output_dir.join("inline.ts");
-        Builder::<tauri::Wry>::new()
+        Builder::<tauri::DynRuntime>::new()
             .typ::<inline::Channel>()
             .export(Typescript::default(), &inline_path)
             .expect("an inline type named Channel should not conflict with the runtime");
@@ -1440,13 +2286,13 @@ mod tests {
                 .contains("export type Channel")
         );
 
-        let err = Builder::<tauri::Wry>::new()
+        let err = Builder::<tauri::DynRuntime>::new()
             .typ::<unrenamed::Channel>()
             .export(Typescript::default(), output_dir.join("unrenamed.ts"))
             .expect_err("a flat export named Channel should conflict with the runtime");
         assert!(err.to_string().contains("User defined type 'Channel'"));
 
-        Builder::<tauri::Wry>::new()
+        Builder::<tauri::DynRuntime>::new()
             .typ::<unrenamed::Channel>()
             .export(JSDoc::default(), output_dir.join("unrenamed.js"))
             .expect_err("a flat JSDoc export named Channel should conflict with the runtime");
@@ -1456,13 +2302,13 @@ mod tests {
             ("unrenamed-module-prefixed", Layout::ModulePrefixedName),
             ("unrenamed-files", Layout::Files),
         ] {
-            Builder::<tauri::Wry>::new()
+            Builder::<tauri::DynRuntime>::new()
                 .typ::<unrenamed::Channel>()
                 .export(Typescript::default().layout(layout), output_dir.join(name))
                 .expect("a scoped Channel should not conflict with the runtime");
         }
 
-        Builder::<tauri::Wry>::new()
+        Builder::<tauri::DynRuntime>::new()
             .typ::<unrenamed::Channel>()
             .export(
                 JSDoc::default().layout(Layout::ModulePrefixedName),
@@ -1470,7 +2316,7 @@ mod tests {
             )
             .expect_err("JSDoc module-prefixed typedefs should retain their bare names");
 
-        Builder::<tauri::Wry>::new()
+        Builder::<tauri::DynRuntime>::new()
             .typ::<unrenamed::Channel>()
             .export(
                 JSDoc::default().layout(Layout::Files),
@@ -1489,7 +2335,7 @@ mod tests {
         ));
         fs::create_dir_all(&output_dir).expect("failed to create test output directory");
 
-        let builder = Builder::<tauri::Wry>::new()
+        let builder = Builder::<tauri::DynRuntime>::new()
             .commands(collect_commands![nullable_result])
             .error_handling(ErrorHandlingMode::DataError);
 
@@ -1520,27 +2366,90 @@ mod tests {
     }
 
     #[test]
+    fn result_unknown_mode_types_error_as_unknown_without_rethrow() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "tauri-specta-result-unknown-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&output_dir).expect("failed to create test output directory");
+
+        let builder = Builder::<tauri::DynRuntime>::new()
+            .commands(collect_commands![nullable_result])
+            .error_handling(ErrorHandlingMode::ResultUnknown);
+
+        let ts_path = output_dir.join("bindings.ts");
+        builder
+            .clone()
+            .export(Typescript::default(), &ts_path)
+            .expect("failed to export TypeScript bindings");
+        let ts = fs::read_to_string(ts_path).expect("failed to read TypeScript bindings");
+        assert!(
+            ts.contains(
+                "Promise<{ status: \"ok\"; data: T } | { status: \"error\"; error: unknown }>"
+            ),
+            "TypeScript runtime should declare the error as `unknown`:\n{ts}"
+        );
+        assert!(
+            ts.contains("return { status: \"error\", error: e };"),
+            "TypeScript runtime should return the rejection in the result object:\n{ts}"
+        );
+        assert!(
+            !ts.contains("instanceof Error"),
+            "TypeScript runtime should not rethrow:\n{ts}"
+        );
+        // The `Err` type argument is still passed even though it no longer types the error.
+        assert!(ts.contains("typedError<string | null, string>"));
+
+        let js_path = output_dir.join("bindings.js");
+        builder
+            .export(JSDoc::default(), &js_path)
+            .expect("failed to export JSDoc bindings");
+        let js = fs::read_to_string(js_path).expect("failed to read JSDoc bindings");
+        assert!(
+            js.contains(
+                "@returns {Promise<{ status: \"ok\"; data: string | null } | { status: \"error\"; error: unknown }>}"
+            ),
+            "JSDoc command typedef should declare the error as `unknown`:\n{js}"
+        );
+        assert!(
+            js.contains(
+                "@returns {Promise<{ status: \"ok\"; data: T } | { status: \"error\"; error: unknown }>}"
+            ),
+            "JSDoc runtime typedef should declare the error as `unknown`:\n{js}"
+        );
+        assert!(
+            !js.contains("instanceof Error"),
+            "JSDoc runtime should not rethrow:\n{js}"
+        );
+
+        fs::remove_dir_all(output_dir).expect("failed to remove test output directory");
+    }
+
+    #[test]
     fn data_error_mode_rejects_nullable_error_types() {
         for (name, builder) in [
             (
                 "unit",
-                Builder::<tauri::Wry>::new().commands(collect_commands![nullable_error]),
+                Builder::<tauri::DynRuntime>::new().commands(collect_commands![nullable_error]),
             ),
             (
                 "unit-struct",
-                Builder::<tauri::Wry>::new().commands(collect_commands![unit_struct_error]),
+                Builder::<tauri::DynRuntime>::new().commands(collect_commands![unit_struct_error]),
             ),
             (
                 "generic-unit",
-                Builder::<tauri::Wry>::new().commands(collect_commands![generic_nullable_error]),
+                Builder::<tauri::DynRuntime>::new()
+                    .commands(collect_commands![generic_nullable_error]),
             ),
             (
                 "untagged-unit",
-                Builder::<tauri::Wry>::new().commands(collect_commands![untagged_nullable_error]),
+                Builder::<tauri::DynRuntime>::new()
+                    .commands(collect_commands![untagged_nullable_error]),
             ),
             (
                 "floating-point",
-                Builder::<tauri::Wry>::new().commands(collect_commands![floating_point_error]),
+                Builder::<tauri::DynRuntime>::new()
+                    .commands(collect_commands![floating_point_error]),
             ),
         ] {
             let output_path = std::env::temp_dir().join(format!(
@@ -1573,7 +2482,7 @@ mod tests {
             "tauri-specta-nullable-semantic-error-test-{}.ts",
             std::process::id()
         ));
-        let err = Builder::<tauri::Wry>::new()
+        let err = Builder::<tauri::DynRuntime>::new()
             .commands(collect_commands![semantic_nullable_error])
             .semantic_types(semantic_types)
             .error_handling(ErrorHandlingMode::DataError)
@@ -1582,5 +2491,154 @@ mod tests {
         assert!(err.to_string().contains(
             "DataError mode requires a non-nullable command error type because null marks a successful result"
         ));
+    }
+
+    #[test]
+    fn mock_runtime_names_are_only_reserved_for_a_mocks_export() {
+        let output_dir = std::path::Path::new("target/tests/mocks-reserved-names");
+        let _ = fs::remove_dir_all(output_dir);
+        fs::create_dir_all(output_dir).expect("failed to create test output directory");
+
+        // The mocks runtime is opt-in, so its names must not stop a user type from
+        // exporting on a build that never emits it.
+        let builder = Builder::<tauri::DynRuntime>::new().typ::<mock_names::MockCommandHandlers>();
+
+        builder
+            .export(Typescript::default(), output_dir.join("bindings.ts"))
+            .expect("mocks runtime names should not be reserved without `Builder::mocks`");
+        assert!(
+            fs::read_to_string(output_dir.join("bindings.ts"))
+                .expect("failed to read TypeScript bindings")
+                .contains("export type MockCommandHandlers = {")
+        );
+
+        builder
+            .export(JSDoc::default(), output_dir.join("bindings.js"))
+            .expect("mocks runtime names should not be reserved without `Builder::mocks`");
+        assert!(
+            fs::read_to_string(output_dir.join("bindings.js"))
+                .expect("failed to read JSDoc bindings")
+                .contains("MockCommandHandlers")
+        );
+
+        let err = Builder::<tauri::DynRuntime>::new()
+            .commands(collect_commands![nullable_result])
+            .mocks()
+            .typ::<mock_names::MockCommandHandlers>()
+            .export(Typescript::default(), output_dir.join("conflict.ts"))
+            .expect_err("mocks runtime names should be reserved by `Builder::mocks`");
+        assert!(
+            err.to_string()
+                .contains("User defined type 'MockCommandHandlers'"),
+            "{err}"
+        );
+
+        fs::remove_dir_all(output_dir).expect("failed to remove test output directory");
+    }
+
+    #[test]
+    fn mocks_reject_semantic_type_transforms() {
+        let output_dir = std::path::Path::new("target/tests/mocks-semantic-types");
+        let _ = fs::remove_dir_all(output_dir);
+        fs::create_dir_all(output_dir).expect("failed to create test output directory");
+
+        // Without a semantic type there is no transform, so the handler is typed against
+        // the value that really crosses the IPC boundary.
+        Builder::<tauri::DynRuntime>::new()
+            .commands(collect_commands![nested_semantic_bytes])
+            .mocks()
+            .export(Typescript::default(), output_dir.join("bindings.ts"))
+            .expect("mocks without semantic types should export");
+        assert!(
+            fs::read_to_string(output_dir.join("bindings.ts"))
+                .expect("failed to read TypeScript bindings")
+                .contains("nestedSemanticBytes: (args: { input: NestedSemanticBytes })"),
+        );
+
+        // A rule nested in a struct does get a transform, and the handler would be handed
+        // the transformed value. That can't be typed without re-deriving the transform's
+        // output type, so it is refused rather than mistyped.
+        let err = Builder::<tauri::DynRuntime>::new()
+            .commands(collect_commands![nested_semantic_bytes])
+            .semantic_types(semantic_bytes())
+            .mocks()
+            .export(Typescript::default(), output_dir.join("semantic.ts"))
+            .expect_err("a semantic type transform should be refused by `Builder::mocks`");
+        assert!(
+            err.to_string()
+                .contains("argument 'input' is reshaped by a semantic type transform"),
+            "{err}"
+        );
+
+        fs::remove_dir_all(output_dir).expect("failed to remove test output directory");
+    }
+
+    #[test]
+    fn mocks_dispatch_on_the_plugin_prefixed_command_name() {
+        // The mock switch has to match the name Tauri's invoke handler receives, which
+        // for a plugin is prefixed the same way the generated `commands` call is.
+        let output_dir = std::path::Path::new("target/tests/mocks-plugin");
+        let _ = fs::remove_dir_all(output_dir);
+        fs::create_dir_all(output_dir).expect("failed to create test output directory");
+
+        Builder::<tauri::DynRuntime>::new()
+            .plugin_name("my-plugin")
+            .commands(collect_commands![nullable_result])
+            .mocks()
+            .export(Typescript::default(), output_dir.join("bindings.ts"))
+            .expect("failed to export TypeScript bindings");
+
+        let ts = fs::read_to_string(output_dir.join("bindings.ts"))
+            .expect("failed to read TypeScript bindings");
+        assert!(
+            ts.contains(
+                r#"case "plugin:my-plugin|nullable_result": return mockCommandHandler(mockHandlers.nullableResult, "plugin:my-plugin|nullable_result", args);"#
+            ),
+            "{ts}"
+        );
+
+        fs::remove_dir_all(output_dir).expect("failed to remove test output directory");
+    }
+
+    #[test]
+    fn result_unknown_mode_widens_error_transform_input() {
+        // The error is typed `unknown`, so a transform written against the command's
+        // error type (`BigInt(v.error)`) would not type-check. The generated mapper
+        // widens the input; the runtime value is unchanged.
+        let semantic_types =
+            specta_typescript::semantic::Configuration::empty().enable_lossless_bigints();
+
+        let unknown_path = std::env::temp_dir().join(format!(
+            "tauri-specta-result-unknown-semantic-error-test-{}.ts",
+            std::process::id()
+        ));
+        Builder::<tauri::DynRuntime>::new()
+            .commands(collect_commands![bigint_error])
+            .semantic_types(semantic_types.clone())
+            .error_handling(ErrorHandlingMode::ResultUnknown)
+            .export(Typescript::default(), &unknown_path)
+            .expect("failed to export TypeScript bindings");
+        let ts = fs::read_to_string(&unknown_path).expect("failed to read TypeScript bindings");
+        assert!(
+            ts.contains("BigInt((v.error as any))"),
+            "the error transform should be widened to accept `unknown`:\n{ts}"
+        );
+
+        // `Result` types the error as the command's own type, so the transform stays narrow.
+        let result_path = std::env::temp_dir().join(format!(
+            "tauri-specta-result-semantic-error-test-{}.ts",
+            std::process::id()
+        ));
+        Builder::<tauri::DynRuntime>::new()
+            .commands(collect_commands![bigint_error])
+            .semantic_types(semantic_types)
+            .error_handling(ErrorHandlingMode::Result)
+            .export(Typescript::default(), &result_path)
+            .expect("failed to export TypeScript bindings");
+        let ts = fs::read_to_string(&result_path).expect("failed to read TypeScript bindings");
+        assert!(
+            ts.contains("BigInt(v.error)") && !ts.contains("(v.error as any)"),
+            "`Result` should keep the narrow error transform:\n{ts}"
+        );
     }
 }

@@ -2,7 +2,7 @@
 #![cfg(feature = "typescript")]
 
 use specta::Type;
-use tauri_specta::{Builder, collect_commands};
+use tauri_specta::{Builder, ErrorHandlingMode, collect_commands};
 
 #[derive(serde::Serialize, serde::Deserialize, Type)]
 struct Thing {
@@ -55,7 +55,7 @@ fn named_types_inside_options_are_referenced() {
         std::process::id()
     ));
 
-    Builder::<tauri::Wry>::new()
+    Builder::<tauri::DynRuntime>::new()
         .commands(collect_commands![
             bare,
             optional,
@@ -63,15 +63,19 @@ fn named_types_inside_options_are_referenced() {
             listed,
             resulted
         ])
+        .error_handling(ErrorHandlingMode::Result)
         .export(specta_typescript::Typescript::default(), &path)
         .expect("bindings export should succeed");
 
     let bindings = std::fs::read_to_string(&path).expect("bindings should be readable");
     std::fs::remove_file(path).expect("temporary bindings should be removable");
 
-    assert!(bindings.contains("bare: (thing: Thing)"), "{bindings}");
     assert!(
-        bindings.contains("optional: (thing: Thing | null)"),
+        bindings.contains("bare: (thing: Thing, options?: InvokeOptions)"),
+        "{bindings}"
+    );
+    assert!(
+        bindings.contains("optional: (thing: Thing | null, options?: InvokeOptions)"),
         "{bindings}"
     );
     assert!(
@@ -79,10 +83,15 @@ fn named_types_inside_options_are_referenced() {
         "{bindings}"
     );
     assert!(
-        bindings.contains("optionalInline: (thing: {\n\tid: number,\n} | null)"),
+        bindings.contains(
+            "optionalInline: (thing: {\n\tid: number,\n} | null, options?: InvokeOptions)"
+        ),
         "{bindings}"
     );
-    assert!(bindings.contains("listed: (thing: Thing[])"), "{bindings}");
+    assert!(
+        bindings.contains("listed: (thing: Thing[], options?: InvokeOptions)"),
+        "{bindings}"
+    );
     assert!(
         bindings.contains("typedError<Thing | null, string>("),
         "{bindings}"

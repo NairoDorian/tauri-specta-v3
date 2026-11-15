@@ -1,3 +1,40 @@
+/// Returns the Rust identifier of the last segment of a command path, as a string.
+///
+/// `collect_commands!` passes a generics-stripped path, so the recursion only has to walk
+/// `a::b::command` down to `command`. This is used to match a Tauri rename against the name
+/// Specta collected the function under.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tauri_command_ident {
+    ($b:ident) => {
+        stringify!($b)
+    };
+    ($b:ident :: $($rest:tt)*) => {
+        $crate::__tauri_command_ident!($($rest)*)
+    };
+}
+
+/// Builds the path to Tauri's hidden `__tauri_command_name_<fn>!()` macro for a command path.
+///
+/// `#[tauri::command]` emits `macro_rules! __tauri_command_name_<fn>` and imports it at the
+/// function's path, so `a::b::command` maps to `a::b::__tauri_command_name_command!()`.
+/// `paste` constructs the final ident because `macro_rules!` can't rewrite the last segment
+/// of a path on its own. The module path is accumulated first and passed to a single `paste!`
+/// call, because a macro invocation can't appear as an interior path segment.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tauri_command_name {
+    (@acc [$($prefix:ident ::)*] $b:ident :: $($rest:tt)*) => {
+        $crate::__tauri_command_name!(@acc [$($prefix ::)* $b ::] $($rest)*)
+    };
+    (@acc [$($prefix:ident ::)*] $b:ident) => {
+        $crate::internal::_tauri_specta_paste! { $($prefix ::)* [<__tauri_command_name_ $b>]!() }
+    };
+    ($($path:tt)*) => {
+        $crate::__tauri_command_name!(@acc [] $($path)*)
+    };
+}
+
 /// Collect commands and their types.
 ///
 /// This is a combination of Tauri's [`generate_handler`](tauri::generate_handler) and Specta's [`collect_functions`](specta::function),
@@ -27,16 +64,41 @@
 ///     }
 /// }
 ///
-/// let mut builder = Builder::<tauri::Wry>::new()
+/// let mut builder = Builder::<tauri::DynRuntime>::new()
 ///     .commands(collect_commands![
 ///         // You can pass a function name.
 ///         hello_world,
 ///         // You can also pass a module.
 ///         hello::world,
 ///         // Unlike `tauri::generate_handler` you may need to specify generics.
-///         generic_command::<tauri::Wry>
+///         generic_command::<tauri::DynRuntime>
 ///     ]);
 /// ```
+///
+/// # Requirements and limitations
+///
+/// - Every command needs both `#[tauri::command]` and `#[specta::specta]`. Tauri
+///   builds the invoke handler from the first, and Specta generates the bindings
+///   from the second.
+/// - The command function must be visible at the `collect_commands!` call site. A
+///   command defined in another module has to be `pub` (or `pub(crate)`), or the
+///   expansion fails with ``E0603: macro import `__cmd__my_command` is private``,
+///   along with the same error for `__specta__fn__my_command`. It is the
+///   function's visibility that matters, not the visibility of the types used in
+///   its arguments: a private `tauri::State<T>` argument on a `pub` command is
+///   fine.
+/// - Generic commands need their generics spelled at the call site, like
+///   `generic_command::<tauri::DynRuntime>` above. A generic parameter belonging to an
+///   enclosing function cannot be used, because the macro expands into a new
+///   item (`E0401: can't use generic parameters from outer item`). Pass the
+///   concrete runtime instead.
+/// - Only free functions are supported. `#[specta::specta]` on an inherent or
+///   trait `impl` method fails to compile with "macro definition is not supported
+///   in `trait`s or `impl`s", and `#[tauri::command]` does not support them
+///   either.
+/// - `#[tauri::command(rename = "...")]` is honoured: the generated bindings invoke
+///   the renamed IPC name while the frontend accessor keeps following the Rust
+///   identifier and [`Builder::function_casing`](crate::Builder::function_casing).
 ///
 #[macro_export]
 macro_rules! collect_commands {
@@ -45,6 +107,14 @@ macro_rules! collect_commands {
         $crate::internal::command(
             ::tauri::generate_handler![$($b $($(::$p)? )* ),*],
             ::specta::function::collect_functions![$($b $($(::$p)? $(::<$($g),*>)? )* ),*],
+            // Pair each command's Rust identifier with the name Tauri's handler accepts.
+            // `internal::command` matches these onto the collected functions by name.
+            &[$(
+                (
+                    $crate::__tauri_command_ident!($b $($(::$p)? )*),
+                    $crate::__tauri_command_name!($b $($(::$p)? )*),
+                )
+            ),*],
         )
     };
 }
@@ -75,7 +145,7 @@ macro_rules! collect_commands {
 ///     pub struct World(String);
 /// }
 ///
-/// let mut builder = Builder::<tauri::Wry>::new()
+/// let mut builder = Builder::<tauri::DynRuntime>::new()
 ///     .events(collect_events![
 ///         // You can pass a struct name.
 ///         MyEvent,

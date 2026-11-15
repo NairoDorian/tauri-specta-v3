@@ -31,7 +31,7 @@
 //!     // Update the user in your application state.
 //! }
 //!
-//! let commands = CommandSet::<tauri::Wry>::new(
+//! let commands = CommandSet::<tauri::DynRuntime>::new(
 //!     collect_commands![get_user],
 //!     collect_commands![rename_user],
 //! );
@@ -107,9 +107,8 @@
 //! and mounted.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc(
-    // TODO: Tauri Specta logo
-    html_logo_url = "https://github.com/specta-rs/specta/raw/main/.github/logo-128.png",
-    html_favicon_url = "https://github.com/specta-rs/specta/raw/main/.github/logo-128.png"
+    html_logo_url = "https://github.com/specta-rs/tauri-specta/raw/main/.github/logo.png",
+    html_favicon_url = "https://github.com/specta-rs/tauri-specta/raw/main/.github/logo.png"
 )]
 
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
@@ -118,7 +117,7 @@ use heck::ToLowerCamelCase;
 use serde::Serialize;
 use specta::{Type, Types, datatype};
 use tauri::{Runtime, ipc::Invoke};
-use tauri_specta::{Casing, Commands, Events};
+use tauri_specta::{Casing, CollectedCommands, Commands, Events};
 
 /// A collection of query commands, mutation commands, and their shared bindings.
 ///
@@ -128,6 +127,7 @@ pub struct CommandSet<R: Runtime> {
     handler: Arc<dyn Fn(Invoke<R>) -> bool + Send + Sync + 'static>,
     queries: Vec<datatype::Function>,
     mutations: Vec<datatype::Function>,
+    accessor_names: BTreeMap<Cow<'static, str>, Cow<'static, str>>,
     types: Types,
     events: Events,
     constants: BTreeMap<Cow<'static, str>, serde_json::Value>,
@@ -135,6 +135,13 @@ pub struct CommandSet<R: Runtime> {
 }
 
 impl<R: Runtime> CommandSet<R> {
+    /// The name a function's generated accessor is derived from, before casing.
+    fn accessor_name<'a>(&'a self, function: &'a datatype::Function) -> &'a str {
+        self.accessor_names
+            .get(function.name())
+            .map_or_else(|| function.name(), |name| name.as_ref())
+    }
+
     /// Creates a command set from query commands and mutation commands.
     ///
     /// Both arguments are normally created with
@@ -145,8 +152,11 @@ impl<R: Runtime> CommandSet<R> {
         let Commands(mutation_invoke, mutation_types) = mutations;
 
         let mut types = Types::default();
-        let queries = query_types(&mut types);
-        let mutations = mutation_types(&mut types);
+        let query_collected = query_types(&mut types);
+        let mutation_collected = mutation_types(&mut types);
+
+        let mut accessor_names = query_collected.accessor_names;
+        accessor_names.extend(mutation_collected.accessor_names);
 
         Self {
             handler: Arc::new(move |i| {
@@ -156,8 +166,9 @@ impl<R: Runtime> CommandSet<R> {
                     acl: i.acl.clone(),
                 }) || (mutation_invoke)(i)
             }),
-            queries,
-            mutations,
+            queries: query_collected.functions,
+            mutations: mutation_collected.functions,
+            accessor_names,
             types,
             events: Default::default(),
             constants: Default::default(),
@@ -226,7 +237,7 @@ impl<R: Runtime> CommandSet<R> {
     /// use tauri_specta::{Casing, collect_commands};
     /// use tauri_specta_query::CommandSet;
     ///
-    /// let commands = CommandSet::<tauri::Wry>::new(
+    /// let commands = CommandSet::<tauri::DynRuntime>::new(
     ///     collect_commands![],
     ///     collect_commands![],
     /// )
@@ -253,6 +264,9 @@ impl<R: Runtime> CommandSet<R> {
         let mut constants = self.constants.clone();
         constants.extend(other.constants.clone());
 
+        let mut accessor_names = self.accessor_names.clone();
+        accessor_names.extend(other.accessor_names.clone());
+
         Self {
             handler: Arc::new(move |i| {
                 (handler)(Invoke {
@@ -268,6 +282,7 @@ impl<R: Runtime> CommandSet<R> {
                 .chain(&other.mutations)
                 .cloned()
                 .collect(),
+            accessor_names,
             types,
             events: self.events.clone().merge(other.events.clone()),
             constants,
@@ -290,7 +305,10 @@ impl<R: Runtime> CommandSet<R> {
             if !self.queries.is_empty() {
                 output.push_str("\nexport const queries = {");
                 for function in &self.queries {
-                    let name = self.function_casing.apply(&function.name).into_owned();
+                    let name = self
+                        .function_casing
+                        .apply(self.accessor_name(function))
+                        .into_owned();
                     let name_json =
                         serde_json::to_string(&name).expect("failed to serialize query name");
                     let property = render_property_name(&name);
@@ -312,7 +330,10 @@ impl<R: Runtime> CommandSet<R> {
 
                 output.push_str("\nexport const queryKeys = {");
                 for function in &self.queries {
-                    let name = self.function_casing.apply(&function.name).into_owned();
+                    let name = self
+                        .function_casing
+                        .apply(self.accessor_name(function))
+                        .into_owned();
                     let name_json =
                         serde_json::to_string(&name).expect("failed to serialize query name");
                     let property = render_property_name(&name);
@@ -328,7 +349,10 @@ impl<R: Runtime> CommandSet<R> {
             if !self.mutations.is_empty() {
                 output.push_str("\nexport const mutations = {");
                 for function in &self.mutations {
-                    let name = self.function_casing.apply(&function.name).into_owned();
+                    let name = self
+                        .function_casing
+                        .apply(self.accessor_name(function))
+                        .into_owned();
                     let name_json =
                         serde_json::to_string(&name).expect("failed to serialize mutation name");
                     let property = render_property_name(&name);
@@ -377,7 +401,10 @@ impl<R: Runtime> CommandSet<R> {
 
                 output.push_str("\nexport const mutationKeys = {");
                 for function in &self.mutations {
-                    let name = self.function_casing.apply(&function.name).into_owned();
+                    let name = self
+                        .function_casing
+                        .apply(self.accessor_name(function))
+                        .into_owned();
                     let name_json =
                         serde_json::to_string(&name).expect("failed to serialize mutation name");
                     let property = render_property_name(&name);
@@ -391,19 +418,29 @@ impl<R: Runtime> CommandSet<R> {
                 output.push('\n');
             }
 
+            // The fragment is concatenated after the Tauri Specta runtime, which already
+            // ends the file, so a trailing newline here would leave a blank line at EOF.
+            while output.ends_with('\n') {
+                output.pop();
+            }
+
             output
         };
 
         let mut commands = self.queries;
         commands.extend(self.mutations);
         let types = self.types;
+        let accessor_names = self.accessor_names;
 
         let mut builder = tauri_specta::Builder::<R>::new()
             .commands(Commands(
                 self.handler,
                 Arc::new(move |tys| {
                     tys.extend(&types);
-                    commands.clone()
+                    CollectedCommands {
+                        functions: commands.clone(),
+                        accessor_names: accessor_names.clone(),
+                    }
                 }),
             ))
             .events(self.events)
@@ -544,8 +581,10 @@ mod tests {
         assert!(output.contains("queryFn: () => commands.get_user(...args)"));
         assert!(output.contains("rename_user: () => mutationOptions"));
         assert!(output.contains("commands.rename_user(input.userId, input.displayName)"));
-        assert!(output.contains("get_user: (userId: number)"));
-        assert!(output.contains("rename_user: (userId: number, displayName: string)"));
+        assert!(output.contains("get_user: (userId: number, options?: InvokeOptions)"));
+        assert!(output.contains(
+            "rename_user: (userId: number, displayName: string, options?: InvokeOptions)"
+        ));
     }
 
     #[test]
@@ -558,5 +597,16 @@ mod tests {
         assert!(output.contains(r#"queryFn: () => commands["get-user"](...args)"#));
         assert!(output.contains(r#""rename-user": () => mutationOptions"#));
         assert!(output.contains(r#"commands["rename-user"](input.userId, input.displayName)"#));
+    }
+
+    #[test]
+    fn exported_bindings_end_with_a_single_newline() {
+        let output = export(Casing::CamelCase);
+
+        assert!(output.ends_with('\n'), "bindings should end with a newline");
+        assert!(
+            !output.ends_with("\n\n"),
+            "the raw query fragment should not leave a blank line at the end of the file"
+        );
     }
 }

@@ -13,11 +13,35 @@ use tauri::{Manager, Runtime, ipc::Invoke};
 /// The mode which the error handling is done in the bindings.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub enum ErrorHandlingMode {
-    /// Errors will be thrown
+    /// Errors will be thrown.
+    ///
+    /// This is the default and matches what a plain [`tauri::command`] does: a failed
+    /// command rejects the returned promise. Command results are typed as `T`, and the
+    /// error type is not represented in the bindings.
+    #[default]
     Throw,
     /// Errors will be returned as a status-tagged result object.
-    #[default]
+    ///
+    /// Successful commands return `{ status: "ok"; data: T }`, failed commands return
+    /// `{ status: "error"; error: E }`.
     Result,
+    /// Errors will be returned as a status-tagged result object, with the error
+    /// typed as `unknown`.
+    ///
+    /// This is the same shape as [`ErrorHandlingMode::Result`] — successful
+    /// commands return `{ status: "ok"; data: T }`, failed commands return
+    /// `{ status: "error"; error: unknown }` — but the injected runtime never
+    /// rethrows, so every rejection is delivered inside the result object.
+    ///
+    /// A rejected `invoke` may carry the command's own error value or a
+    /// framework-level failure (an unknown command, a badly typed argument, an
+    /// ACL denial) and the two are indistinguishable at the JavaScript
+    /// boundary. [`ErrorHandlingMode::Result`] assumes the value is the
+    /// command's declared error type and rethrows anything that is an `Error`
+    /// instance, which escapes the result union. Use this mode when you want
+    /// exhaustive handling with no escape hatch and are happy to narrow the
+    /// error yourself.
+    ResultUnknown,
     /// Errors will be returned as a data/error result object.
     ///
     /// Successful commands return `{ data: T, error: null }`, while failed
@@ -102,6 +126,10 @@ pub struct BuilderConfiguration {
     pub plugin_name: Option<&'static str>,
     /// Commands registered on the builder.
     pub commands: Vec<Function>,
+    /// Maps each renamed command's effective Tauri name back to the Rust identifier its
+    /// generated frontend accessor is derived from. Populated for commands that use
+    /// `#[tauri::command(rename = "...")]`.
+    pub command_accessor_names: BTreeMap<Cow<'static, str>, Cow<'static, str>>,
     /// Error handling mode used by generated bindings.
     pub error_handling: ErrorHandlingMode,
     /// Event names mapped to their type metadata.
@@ -122,6 +150,20 @@ pub struct BuilderConfiguration {
     pub disable_serde_phases: bool,
     /// Casing applied to generated command and event accessor names.
     pub function_casing: Casing,
+    /// Whether typed mock helpers are exported alongside the bindings.
+    pub mocks: bool,
+}
+
+impl BuilderConfiguration {
+    /// The name a command's generated frontend accessor is derived from, before casing.
+    ///
+    /// This is the command's Rust identifier even when `#[tauri::command(rename = "...")]`
+    /// changed the IPC name the bindings invoke.
+    pub fn command_accessor_name<'a>(&'a self, command: &'a Function) -> &'a str {
+        self.command_accessor_names
+            .get(command.name())
+            .map_or_else(|| command.name(), |name| name.as_ref())
+    }
 }
 
 impl<R: Runtime> Default for Builder<R> {
@@ -160,6 +202,13 @@ impl<R: Runtime> Builder<R> {
     ///
     /// **WARNING:** This method will overwrite any previously registered commands.
     ///
+    /// # Panics
+    ///
+    /// Panics if the same command is registered twice. Generated bindings key commands by
+    /// name, so a duplicate would silently keep only the last registration. This is checked
+    /// here rather than at export so it also fires in release builds, which usually don't
+    /// export bindings.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -171,10 +220,18 @@ impl<R: Runtime> Builder<R> {
     ///     format!("Hello, {my_name}! You've been greeted from Rust!")
     /// }
     ///
-    /// let mut builder = Builder::<tauri::Wry>::new().commands(collect_commands![hello_world]);
+    /// let mut builder = Builder::<tauri::DynRuntime>::new().commands(collect_commands![hello_world]);
     /// ```
+    #[allow(clippy::panic)]
     pub fn commands(mut self, commands: Commands<R>) -> Self {
-        self.cfg.commands = (commands.1)(&mut self.cfg.types);
+        let collected = (commands.1)(&mut self.cfg.types);
+        self.cfg.commands = collected.functions;
+        self.cfg.command_accessor_names = collected.accessor_names;
+        if let Some(name) = crate::commands::duplicate_command_name(&self.cfg.commands) {
+            panic!(
+                "Command '{name}' is registered multiple times. Remove the duplicate registration."
+            );
+        }
         Self {
             commands,
             cfg: self.cfg,
@@ -195,7 +252,7 @@ impl<R: Runtime> Builder<R> {
     /// #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
     /// pub struct DemoEvent(String);
     ///
-    /// let mut builder = Builder::<tauri::Wry>::new().events(collect_events![DemoEvent]);
+    /// let mut builder = Builder::<tauri::DynRuntime>::new().events(collect_events![DemoEvent]);
     /// ```
     pub fn events(mut self, events: Events) -> Self {
         self.cfg.events = events
@@ -222,7 +279,7 @@ impl<R: Runtime> Builder<R> {
     ///     a: String
     /// }
     ///
-    /// let mut builder = Builder::<tauri::Wry>::new().typ::<MyStruct>();
+    /// let mut builder = Builder::<tauri::DynRuntime>::new().typ::<MyStruct>();
     /// ```
     pub fn typ<T: Type>(mut self) -> Self {
         self.cfg.types.register_mut::<T>();
@@ -239,7 +296,7 @@ impl<R: Runtime> Builder<R> {
     /// use tauri_specta::Builder;
     /// use specta::{Type, Types};
     ///
-    /// let mut builder = Builder::<tauri::Wry>::new().types(&Types::default());
+    /// let mut builder = Builder::<tauri::DynRuntime>::new().types(&Types::default());
     /// ```
     pub fn types(mut self, types: &Types) -> Self {
         self.cfg.types.extend(types);
@@ -255,7 +312,7 @@ impl<R: Runtime> Builder<R> {
     /// ```rust
     /// use tauri_specta::Builder;
     ///
-    /// let mut builder = Builder::<tauri::Wry>::new().constant("CONSTANT_NAME","ANY_CONSTANT_VALUE");
+    /// let mut builder = Builder::<tauri::DynRuntime>::new().constant("CONSTANT_NAME","ANY_CONSTANT_VALUE");
     /// ```
     #[track_caller]
     pub fn constant<T: Serialize>(mut self, k: impl Into<Cow<'static, str>>, v: T) -> Self {
@@ -267,6 +324,16 @@ impl<R: Runtime> Builder<R> {
     }
 
     /// Set the error handling mode for the generated bindings.
+    ///
+    /// [`ErrorHandlingMode::Result`] and [`ErrorHandlingMode::DataError`] inject a runtime
+    /// that rethrows when the rejected value is an `Error` instance — a genuine
+    /// JavaScript-level failure rather than a value the command returned — instead of
+    /// returning it in the result object. [`ErrorHandlingMode::ResultUnknown`] (or a custom
+    /// [`Builder::typed_error_impl`]) is how you opt out of that.
+    ///
+    /// Note that framework-level Tauri failures (an unknown command, a badly typed
+    /// argument, an ACL denial) reject with a free-form string, so a command's declared
+    /// error type `E` only describes errors the command itself returned.
     pub fn error_handling(mut self, error_handling: ErrorHandlingMode) -> Self {
         self.cfg.error_handling = error_handling;
         self
@@ -275,6 +342,11 @@ impl<R: Runtime> Builder<R> {
     /// Replace the internal implementation of the `typedError` function.
     /// This would allow integrating with Effect or any other result library.
     /// The implementation must return the shape selected by [`ErrorHandlingMode`].
+    ///
+    /// The built-in runtime rethrows when the rejection is an `Error` instance (a genuine
+    /// JavaScript-level failure) rather than returning it in the result object. A custom
+    /// implementation is how you opt out of that, alongside
+    /// [`ErrorHandlingMode::ResultUnknown`].
     ///
     /// ```rust
     /// use tauri_specta::Builder;
@@ -288,7 +360,7 @@ impl<R: Runtime> Builder<R> {
     ///     }
     /// }"#;
     ///
-    /// Builder::<tauri::Wry>::default()
+    /// Builder::<tauri::DynRuntime>::default()
     ///  .typed_error_impl(TYPED_ERROR_IMPL);
     /// ```
     pub fn typed_error_impl(mut self, runtime: impl Into<Cow<'static, str>>) -> Self {
@@ -344,10 +416,37 @@ impl<R: Runtime> Builder<R> {
     /// ```rust
     /// use tauri_specta::{Builder, Casing};
     ///
-    /// let mut builder = Builder::<tauri::Wry>::new().function_casing(Casing::SnakeCase);
+    /// let mut builder = Builder::<tauri::DynRuntime>::new().function_casing(Casing::SnakeCase);
     /// ```
     pub fn function_casing(mut self, casing: Casing) -> Self {
         self.cfg.function_casing = casing;
+        self
+    }
+
+    /// Export typed mock helpers alongside the bindings.
+    ///
+    /// This adds a `mockCommands` function and a `MockCommandHandlers` type to the
+    /// generated bindings, so a frontend test can stub commands without hand-writing
+    /// a module that satisfies the bindings' types. Refer to the crate docs for what
+    /// the generated helpers do.
+    ///
+    /// Requires `@tauri-apps/api` v2.7 or newer, which is where `mockIPC` gained
+    /// the `shouldMockEvents` option the generated helper relies on.
+    ///
+    /// The mock helper is only useful to tests, so you usually only want this in a debug
+    /// build — the same `#[cfg(debug_assertions)]` that usually guards the export itself.
+    ///
+    /// This is not supported together with [`Builder::semantic_types`]: where a semantic
+    /// rule applies a transform, a handler would not receive or return the type the
+    /// bindings declare, so the export fails rather than emit a binding that lies.
+    ///
+    /// ```rust
+    /// use tauri_specta::Builder;
+    ///
+    /// let builder = Builder::<tauri::DynRuntime>::new().mocks();
+    /// ```
+    pub fn mocks(mut self) -> Self {
+        self.cfg.mocks = true;
         self
     }
 
@@ -394,11 +493,11 @@ impl<R: Runtime> Builder<R> {
     /// Export the bindings to the filesystem using the provided exporter.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,no_run
     /// use tauri_specta::{Builder, collect_commands, collect_events};
     /// use specta_typescript::Typescript;
     ///
-    /// let mut builder = Builder::<tauri::Wry>::new()
+    /// let mut builder = Builder::<tauri::DynRuntime>::new()
     ///     .commands(collect_commands![])
     ///     .events(collect_events![]);
     ///

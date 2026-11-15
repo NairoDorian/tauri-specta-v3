@@ -1,22 +1,22 @@
 [package]
 name = "tauri-specta"
 description = "Completely typesafe Tauri commands"
-version = "2.0.0-rc.25"
+version = "2.0.0-rc.29"
 authors = ["Oscar Beaumont <oscar@otbeaumont.me>"]
 edition = "2024"
 license = "MIT"
 readme = "README.md"
-include = ["/src", "/README.md", "/LICENCE"]
+include = ["/src", "/README.md", "/LICENSE"]
 repository = "https://github.com/specta-rs/tauri-specta"
 documentation = "https://docs.rs/tauri-specta/latest/tauri-specta"
 keywords = ["async", "specta", "rspc", "typescript", "typesafe"]
 categories = ["web-programming", "asynchronous"]
 
-# /bin/sh RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features
+# /bin/sh RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps
+# `--no-deps` matters: RUSTDOCFLAGS applies to every crate rustdoc builds, and some
+# dependencies still gate removed nightly features behind `cfg(docsrs)`.
 [package.metadata."docs.rs"]
 all-features = true
-rustc-args = ["--cfg", "docsrs"]
-rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
@@ -31,7 +31,7 @@ workspace = true
 # Public
 specta = { workspace = true, features = ["function"] }
 specta-typescript = { workspace = true, optional = true }
-tauri-specta-macros = { version = "=2.0.0-rc.25", optional = true, path = "./macros" }
+tauri-specta-macros = { version = "=2.0.0-rc.29", optional = true, path = "./macros" }
 serde = "1"
 serde_json = "1"
 thiserror = "2"
@@ -39,24 +39,32 @@ tauri = { workspace = true, features = ["specta"] }
 
 # Private
 heck = "0.5"
+paste = "1"
 specta-serde = { workspace = true }
 specta-util = { workspace = true }
 
 [dev-dependencies]
-tauri = { workspace = true, features = ["test", "wry"] }
+# Tauri 3 moved the Wry runtime into `tauri-runtime-wry`; the tests run on
+# `MockRuntime` (the `test` feature), so no runtime is needed here.
+tauri = { workspace = true, features = ["test"] }
 
 [workspace]
-members = [
-  "crates/tauri-specta-query",
+# The example apps are upstream's Tauri 2 apps (`tauri::Builder` with the
+# built-in Wry runtime and the `wry` feature, both gone in Tauri 3), so this
+# fork keeps them out of the workspace rather than half-porting them. The
+# libraries and their test suites are what a Tauri 3 app consumes.
+members = ["crates/tauri-specta-query", "macros"]
+exclude = [
   "examples/app/src-tauri",
   "examples/tanstack-query/src-tauri",
   "examples/custom-plugin/app/src-tauri",
   "examples/custom-plugin/plugin",
-  "macros",
 ]
 
 [workspace.lints.rust]
 unsafe_code = { level = "forbid", priority = -1 }
+# Set only once Tauri 3 implements specta::Type for its IPC types (tests/ipc_types.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tauri_ipc_specta_types)'] }
 missing_docs = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
@@ -68,19 +76,18 @@ panic = { level = "warn", priority = -1 }
 todo = { level = "warn", priority = -1 }
 panic_in_result_fn = { level = "warn", priority = -1 }
 
- [workspace.dependencies]
-tauri = { version = "3.0.0-alpha.0", default-features = false }
-tauri-build = { version = "3.0.0-alpha.0" }
-tauri-plugin = { version = "3.0.0-alpha.0" }
-specta = { version = "2.0.0-rc.26", features = ["derive"] }
-specta-typescript = { version = "0.0.13" }
-specta-serde = { version = "0.0.13" }
-specta-util = { version = "0.0.13" }
+# Tauri 3: this fork exists because upstream tauri-specta publishes for Tauri 2
+# only. The workspace takes the newest 3.0 alphas; a consumer's lock decides the
+# exact release (ZER0 pins its whole Tauri family with `=`).
+[workspace.dependencies]
+tauri = { version = "3.0.0-alpha.6", default-features = false }
+tauri-build = { version = "3.0.0-alpha.4" }
+tauri-plugin = { version = "3.0.0-alpha.4" }
+specta = { version = "=2.0.0-rc.28", features = ["derive"] }
+specta-typescript = { version = "0.0.15" }
+specta-serde = { version = "0.0.15" }
+specta-util = { version = "0.0.15" }
 
-# TODO: Remove once the rc.26 Specta crates are published.
-[patch.crates-io]
-specta = { git = "https://github.com/specta-rs/specta.git", branch = "main" }
-specta-macros = { git = "https://github.com/specta-rs/specta.git", branch = "main" }
-specta-serde = { git = "https://github.com/specta-rs/specta.git", branch = "main" }
-specta-typescript = { git = "https://github.com/specta-rs/specta.git", branch = "main" }
-specta-util = { git = "https://github.com/specta-rs/specta.git", branch = "main" }
+# No [patch.crates-io]: the Specta crates are published (rc.28), and upstream's
+# `tauri` patch is a Tauri 2 branch (tauri-apps/tauri#16374) that does not apply
+# to Tauri 3.

@@ -1,8 +1,16 @@
 {
   "private": true,
+  "type": "module",
   "version": "0.0.0",
-  "scripts": {},
+  "scripts": {
+    "check:bindings": "tsc -p tests/typescript/tsconfig.json",
+    "test:mocks": "node --experimental-strip-types --test \"tests/mocks/**/*.test.mjs\""
+  },
   "dependencies": {
-    "@tauri-apps/api": "^2.11.1"
+    "@tauri-apps/api": "^2.12.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "typescript": "^7.0.2"
   }
 }

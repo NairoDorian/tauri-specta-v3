@@ -13,8 +13,8 @@
 //! To get started run the following commands to add the required dependencies to your `Cargo.toml`:
 //!
 //! ```sh
-//! cargo add tauri@2.0 specta@=2.0.0-rc.25 specta-typescript@0.0.12
-//! cargo add tauri-specta@=2.0.0-rc.25 --features derive,typescript,javascript # `javascript` for JSDoc, `typescript` for Typescript
+//! cargo add tauri@2.0 specta@=2.0.0-rc.28 specta-typescript@0.0.15
+//! cargo add tauri-specta@=2.0.0-rc.28 --features derive,typescript,javascript # `javascript` for JSDoc, `typescript` for Typescript
 //! ```
 //!
 //! ## Features
@@ -74,10 +74,10 @@
 //! If your interested in using JSDoc instead of Typescript you can replace the [`specta_typescript::Typescript`](https://docs.rs/specta-typescript/latest/specta_typescript/struct.Typescript.html) struct
 //! with [`specta_jsdoc::JSDoc`](https://docs.rs/specta-jsdoc/latest/specta_jsdoc/struct.JSDoc.html) like the following:
 //!
-//! ```rust
+//! ```rust,no_run
 //! use specta_typescript::JSDoc;
 //!
-//! let mut builder = tauri_specta::Builder::<tauri::Wry>::new();
+//! let mut builder = tauri_specta::Builder::<tauri::DynRuntime>::new();
 //!
 //! #[cfg(debug_assertions)]
 //! builder
@@ -93,6 +93,81 @@
 //! console.log(await commands.greet("Brendan"));
 //! ```
 //!
+//! ## Error handling
+//!
+//! By default a failed command rejects the promise the binding returns, matching a plain
+//! `invoke`. Command results are typed as the command's success type: for
+//! `fn has_error() -> Result<String, i32>`, `commands.hasError()` returns `Promise<string>`.
+//!
+//! [`Builder::error_handling`] changes how a `Result`-returning command is exposed:
+//!
+//! - [`ErrorHandlingMode::Throw`] (the default) — the promise rejects.
+//! - [`ErrorHandlingMode::Result`] — resolves to `{ status: "ok"; data: T }` or
+//!   `{ status: "error"; error: E }`.
+//! - [`ErrorHandlingMode::ResultUnknown`] — as `Result`, but the error is typed `unknown`
+//!   and the injected runtime never rethrows.
+//! - [`ErrorHandlingMode::DataError`] — resolves to `{ data: T; error: null }` or
+//!   `{ data: null; error: E }`.
+//!
+//! A rejected `invoke` can carry either the command's own error value or a framework-level
+//! failure (an unknown command, a badly typed argument, an ACL denial), and the two are
+//! indistinguishable at the JavaScript boundary. That is why `Result` rethrows anything
+//! that is an `Error` instance and why `ResultUnknown` types the error as `unknown`.
+//! [`Builder::typed_error_impl`] replaces the injected runtime entirely.
+//!
+//! ## Channels
+//!
+//! A [`tauri::ipc::Channel`] streams values from a command to the frontend. A
+//! channel is only valid as a direct argument or return value of a command, and
+//! the generated binding types it as `Channel<T>`.
+//!
+//! ```rust,no_run
+//! use tauri::ipc::Channel;
+//!
+//! #[tauri::command]
+//! #[specta::specta]
+//! fn download(url: String, on_progress: Channel<u32>) {
+//!     for chunk in [10, 20, 100] {
+//!         let _ = on_progress.send(chunk);
+//!     }
+//! }
+//! ```
+//!
+//! ```ts
+//! import { Channel } from "@tauri-apps/api/core";
+//! import { commands } from "./bindings";
+//!
+//! const onProgress = new Channel<number>();
+//! onProgress.onmessage = (progress) => console.log(progress);
+//!
+//! await commands.download("https://example.com/file.zip", onProgress);
+//! ```
+//!
+//! A channel cannot be nested inside a struct, enum, or event payload. Only a
+//! top-level command argument or return value is turned into a channel, so a
+//! channel in a nested position is invalid. To send a channel alongside other
+//! data, put a [`tauri::ipc::JavaScriptChannelId`] in the payload and call
+//! `channel_on` to get a `Channel`:
+//!
+//! ```rust,ignore
+//! use tauri::ipc::{Channel, JavaScriptChannelId};
+//!
+//! // `JavaScriptChannelId` has no `specta::Type` impl, so export it as a string.
+//! #[derive(serde::Deserialize, specta::Type)]
+//! struct DownloadRequest {
+//!     url: String,
+//!     #[specta(type = String)]
+//!     on_progress: JavaScriptChannelId,
+//! }
+//!
+//! #[tauri::command]
+//! #[specta::specta]
+//! fn download(request: DownloadRequest, webview: tauri::Webview<tauri::DynRuntime>) {
+//!     let on_progress: Channel<u32> = request.on_progress.channel_on(webview);
+//!     // ...
+//! }
+//! ```
+//!
 //! ## Custom types
 //!
 //! Similar to [`serde::Serialize`] you must put the [`specta::Type`] derive macro on your own types to allow Specta to understand your types. For example:
@@ -106,7 +181,7 @@
 //! }
 //!
 //! // Call `typ()` as much as you want.
-//! let mut builder = tauri_specta::Builder::<tauri::Wry>::new().typ::<MyStruct>();
+//! let mut builder = tauri_specta::Builder::<tauri::DynRuntime>::new().typ::<MyStruct>();
 //! ```
 //!
 //! ## Events
@@ -164,6 +239,55 @@
 //! ```
 //!
 //! Refer to [`Event`] for all the possible methods for listening and emitting events.
+//!
+//! ## Testing
+//!
+//! [`Builder::mocks`] exports a typed mock helper alongside your bindings, so a frontend
+//! test can stub commands without hand-writing a module that satisfies the bindings'
+//! types:
+//!
+//! ```rust
+//! # use tauri_specta::Builder;
+//! let builder = Builder::<tauri::DynRuntime>::new().mocks();
+//! ```
+//!
+//! The bindings then export `MockCommandHandlers`, which is one handler per command
+//! accessor, and `mockCommands`, which installs them through
+//! [`@tauri-apps/api/mocks`](https://v2.tauri.app/develop/tests/mocking/)'s `mockIPC`.
+//! This needs `@tauri-apps/api` v2.7 or newer.
+//!
+//! Because the mock sits at the IPC boundary, the application under test keeps importing
+//! the real `commands` and `events` objects, and everything around the call — argument
+//! transforms, the configured [`ErrorHandlingMode`], event plumbing — behaves as it does
+//! in the app:
+//!
+//! ```ts
+//! import { afterEach, expect, test } from "vitest";
+//! import { clearMocks } from "@tauri-apps/api/mocks";
+//! import { commands, mockCommands } from "./bindings";
+//!
+//! afterEach(() => clearMocks());
+//!
+//! test("greet", async () => {
+//!     mockCommands({ greet: ({ myName }) => `Hello, ${myName}!` });
+//!
+//!     await expect(commands.greet("Brendan")).resolves.toBe("Hello, Brendan!");
+//! });
+//! ```
+//!
+//! A handler receives the command's arguments as a single object and returns the
+//! command's success value; throw, or return a rejected promise, to fail the command.
+//! A command with no handler rejects rather than resolving `undefined`, so a test can't
+//! pass by accident.
+//!
+//! Events need no extra setup. Tauri's own event mocking is enabled as part of the
+//! install, so `events.demoEvent.listen` and friends keep working under test. Tauri's
+//! mock does not implement `emitTo`, which resolves without reaching any listener.
+//!
+//! Mocks and [`Builder::semantic_types`] don't mix: where a semantic rule applies a
+//! transform, the value a handler sees is not the type the bindings declare, and the
+//! transform's output type can't be recovered to type the handler. Rather than emit a
+//! binding that lies, the export fails and says which command is responsible.
 //!
 //! ## Phase-specific types
 //!
@@ -238,16 +362,15 @@
 //! ```rust
 //! use tauri_specta::{Builder, Casing};
 //!
-//! let mut builder = Builder::<tauri::Wry>::new()
+//! let mut builder = Builder::<tauri::DynRuntime>::new()
 //!     // Keep the original Rust naming for command and event accessors.
 //!     .function_casing(Casing::SnakeCase);
 //! ```
 //!
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc(
-    // TODO: Tauri Specta logo
-    html_logo_url = "https://github.com/specta-rs/specta/raw/main/.github/logo-128.png",
-    html_favicon_url = "https://github.com/specta-rs/specta/raw/main/.github/logo-128.png"
+    html_logo_url = "https://github.com/specta-rs/tauri-specta/raw/main/.github/logo.png",
+    html_favicon_url = "https://github.com/specta-rs/tauri-specta/raw/main/.github/logo.png"
 )]
 
 mod builder;
@@ -260,6 +383,8 @@ mod name;
 
 pub use builder::{Builder, BuilderConfiguration, ErrorHandlingMode};
 pub use casing::Casing;
+#[doc(hidden)]
+pub use commands::CollectedCommands;
 pub use commands::Commands;
 pub use event::{Event, Events, TypedEvent};
 pub use lang::LanguageExt;
@@ -280,7 +405,7 @@ pub mod internal {
     //! Nothing in this module has to conform to semver so it should not be used outside of this crate.
     //! It has to be public so the macro's can access it.
 
-    use std::{any::TypeId, sync::Arc};
+    use std::{any::TypeId, collections::BTreeMap, sync::Arc};
 
     use specta::{
         Types,
@@ -288,14 +413,35 @@ pub mod internal {
     };
     use tauri::{Runtime, ipc::Invoke};
 
+    use crate::commands::{CollectedCommands, apply_command_renames};
+
     use super::*;
 
+    /// Re-exported so `collect_commands!` can build the `__tauri_command_name_*` idents
+    /// without requiring users to depend on `paste` themselves.
+    #[doc(hidden)]
+    pub use paste::paste as _tauri_specta_paste;
+
     /// called by `collect_commands` to construct `Commands`
-    pub fn command<R: Runtime, F, T>(f: F, types: T) -> Commands<R>
+    pub fn command<R: Runtime, F, T>(
+        f: F,
+        types: T,
+        renames: &[(&'static str, &'static str)],
+    ) -> Commands<R>
     where
         F: Fn(Invoke<R>) -> bool + Send + Sync + 'static,
         T: Fn(&mut Types) -> Vec<datatype::Function> + Send + Sync + 'static,
     {
+        let renames = renames.to_vec();
+        let types = move |registry: &mut Types| {
+            let mut collected = CollectedCommands {
+                functions: types(registry),
+                accessor_names: BTreeMap::new(),
+            };
+            apply_command_renames(&mut collected, &renames);
+            collected
+        };
+
         Commands(Arc::new(f), Arc::new(types))
     }
 

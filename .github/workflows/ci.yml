@@ -26,9 +26,26 @@ jobs:
     - name: Rust cache
       uses: Swatinem/rust-cache@v2
     - name: Build
-      run: cargo build --all-features
+      run: cargo build --workspace --all-features
     - name: Run tests
-      run: cargo test --all-features
+      if: matrix.os != 'windows-latest'
+      run: cargo test --workspace --all-features
+    - name: Run tests (libraries only)
+      # The examples' test binaries fail to load on the Windows runner
+      # (STATUS_ENTRYPOINT_NOT_FOUND), so only the published libraries are tested there.
+      if: matrix.os == 'windows-latest'
+      run: cargo test -p tauri-specta -p tauri-specta-query -p tauri-specta-macros --all-features
+    - name: Check the example bindings are committed
+      # The tests above regenerate each example's bindings, so anything left in
+      # `examples/` here is a binding that no longer matches the Rust source that
+      # produces it. Windows skips the example tests, so this only runs elsewhere.
+      if: matrix.os != 'windows-latest'
+      run: |
+        if [ -n "$(git status --porcelain -- examples)" ]; then
+          git status --short -- examples
+          echo "::error::the example bindings are out of date; run \`cargo test --workspace --all-features\` and commit the result"
+          exit 1
+        fi
 
   clippy:
     runs-on: ubuntu-latest
@@ -41,4 +58,43 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
       - name: Run Clippy
-        run: cargo clippy --all-features
+        run: cargo clippy --workspace --all-features
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        # Only the root package is needed: the fixtures import `@tauri-apps/api` and the
+        # checker runs `tsc`. Skips installing the examples' dependencies.
+        run: pnpm install --frozen-lockfile --filter .
+      - name: Type-check generated bindings
+        run: pnpm run check:bindings
+      - name: Test generated mocks
+        run: pnpm run test:mocks
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup
+        run: sudo apt-get update && sudo apt-get install libgtk-3-dev webkit2gtk-4.1 libayatana-appindicator3-dev
+      - name: Install Rust toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+      # docs.rs sets `--cfg docsrs`; without this job the `doc(cfg(...))` gates and the
+      # manifest metadata can rot without anyone noticing. `--no-deps` keeps RUSTDOCFLAGS
+      # from leaking into dependencies.
+      - name: Build docs
+        run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps
+
