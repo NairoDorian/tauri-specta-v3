@@ -2,12 +2,13 @@
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 /** @typedef {import("@tauri-apps/api/core").InvokeOptions} InvokeOptions */
+import * as __TAURI_EVENT from "@tauri-apps/api/event";
 import { mockIPC as __TAURI_MOCK_IPC } from "@tauri-apps/api/mocks";
 
 /** Commands */
 export const commands = {
 	/**
-	 *  A command with a doc comment.
+	 * A command with a doc comment.
 	 * @param {string} myName
 	 * @param {InvokeOptions} [options]
 	 * @returns {Promise<string>}
@@ -20,6 +21,139 @@ export const commands = {
 	"unit-command": (options) => __TAURI_INVOKE("unit_command", undefined, options),
 };
 
+/** Built-in Tauri events */
+export const tauriEvents = {
+	/**
+	 * A window was resized. Payload: the new inner size, in physical pixels.
+	 * @type {ReturnType<typeof makeEvent<{ width: number; height: number }>>}
+	 */
+	windowResized: makeEvent("tauri://resize"),
+	/**
+	 * A window moved. Payload: the new outer position, in physical pixels.
+	 * @type {ReturnType<typeof makeEvent<{ x: number; y: number }>>}
+	 */
+	windowMoved: makeEvent("tauri://move"),
+	/**
+	 * The user requested that a window close.
+	 * @type {ReturnType<typeof makeEvent<null>>}
+	 */
+	windowCloseRequested: makeEvent("tauri://close-requested"),
+	/**
+	 * A window was destroyed.
+	 * @type {ReturnType<typeof makeEvent<null>>}
+	 */
+	windowDestroyed: makeEvent("tauri://destroyed"),
+	/**
+	 * A window gained focus.
+	 * @type {ReturnType<typeof makeEvent<null>>}
+	 */
+	windowFocus: makeEvent("tauri://focus"),
+	/**
+	 * A window lost focus.
+	 * @type {ReturnType<typeof makeEvent<null>>}
+	 */
+	windowBlur: makeEvent("tauri://blur"),
+	/**
+	 * The scale factor of the monitor a window is on changed. Payload: the new scale factor and inner size, in physical pixels.
+	 * @type {ReturnType<typeof makeEvent<{ scaleFactor: number; size: { width: number; height: number } }>>}
+	 */
+	windowScaleFactorChanged: makeEvent("tauri://scale-change"),
+	/**
+	 * The system or window theme changed.
+	 * @type {ReturnType<typeof makeEvent<"light" | "dark">>}
+	 */
+	windowThemeChanged: makeEvent("tauri://theme-changed"),
+	/**
+	 * A window was created.
+	 * @type {ReturnType<typeof makeEvent<{ label: string }>>}
+	 */
+	windowCreated: makeEvent("tauri://window-created"),
+	/**
+	 * A window's event loop was suspended. Mobile only.
+	 * @type {ReturnType<typeof makeEvent<null>>}
+	 */
+	windowSuspended: makeEvent("tauri://suspended"),
+	/**
+	 * A window's event loop was resumed. Mobile only.
+	 * @type {ReturnType<typeof makeEvent<null>>}
+	 */
+	windowResumed: makeEvent("tauri://resumed"),
+	/**
+	 * A webview was created.
+	 * @type {ReturnType<typeof makeEvent<{ label: string }>>}
+	 */
+	webviewCreated: makeEvent("tauri://webview-created"),
+	/**
+	 * The user dragged files onto a window. Payload: the dragged paths and the pointer position.
+	 * @type {ReturnType<typeof makeEvent<{ paths: string[]; position: { x: number; y: number } }>>}
+	 */
+	dragEnter: makeEvent("tauri://drag-enter"),
+	/**
+	 * The user is moving dragged files over a window. Payload: the pointer position.
+	 * @type {ReturnType<typeof makeEvent<{ position: { x: number; y: number } }>>}
+	 */
+	dragOver: makeEvent("tauri://drag-over"),
+	/**
+	 * The user dropped files onto a window. Payload: the dropped paths and the pointer position.
+	 * @type {ReturnType<typeof makeEvent<{ paths: string[]; position: { x: number; y: number } }>>}
+	 */
+	dragDrop: makeEvent("tauri://drag-drop"),
+	/**
+	 * The drag operation left a window or was cancelled.
+	 * @type {ReturnType<typeof makeEvent<null>>}
+	 */
+	dragLeave: makeEvent("tauri://drag-leave"),
+};
+
+/* Tauri Specta runtime */
+/**
+ * @template TListen
+ * @template [TEmit=TListen]
+ * @param {string} name
+ * @param {(payload: TEmit) => unknown} [serialize]
+ * @param {(payload: any) => TListen} [deserialize]
+ */
+function makeEvent(name, serialize, deserialize) {
+    /**
+     * @param {__TAURI_EVENT.EventCallback<TListen>} cb
+     * @returns {(event: __TAURI_EVENT.Event<any>) => void}
+     */
+    const mapEvent = (cb) => (event) => cb({ ...event, payload: deserialize ? deserialize(event.payload) : event.payload });
+    /** @param {TEmit} payload */
+    const mapPayload = (payload) => serialize ? serialize(payload) : payload;
+
+    const base = {
+        /** @param {__TAURI_EVENT.EventCallback<TListen>} cb */
+        listen: (cb) => __TAURI_EVENT.listen(name, mapEvent(cb)),
+        /** @param {__TAURI_EVENT.EventCallback<TListen>} cb */
+        once: (cb) => __TAURI_EVENT.once(name, mapEvent(cb)),
+        /** @param {TEmit} payload */
+        emit: (payload) => __TAURI_EVENT.emit(name, mapPayload(payload)),
+        /**
+         * @param {__TAURI_EVENT.EventTarget | string} to
+         * @param {TEmit} payload
+         */
+        emitTo: (to, payload) => __TAURI_EVENT.emitTo(to, name, mapPayload(payload)),
+    };
+
+    /** @param {import("@tauri-apps/api/webview").Webview | import("@tauri-apps/api/window").Window} target */
+    const fn = (target) => ({
+        /** @param {__TAURI_EVENT.EventCallback<TListen>} cb */
+        listen: (cb) => target.listen(name, mapEvent(cb)),
+        /** @param {__TAURI_EVENT.EventCallback<TListen>} cb */
+        once: (cb) => target.once(name, mapEvent(cb)),
+        /** @param {TEmit} payload */
+        emit: (payload) => target.emit(name, mapPayload(payload)),
+        /**
+         * @param {__TAURI_EVENT.EventTarget | string} to
+         * @param {TEmit} payload
+         */
+        emitTo: (to, payload) => target.emitTo(to, name, mapPayload(payload)),
+    });
+
+    return Object.assign(fn, base);
+}
+
 /* Tauri Specta mocks */
 
 /**
@@ -30,22 +164,70 @@ export const commands = {
  */
 
 /**
+ * One command invocation observed by a set of mock handlers.
+ *
+ * `command` is the `commands` accessor that was called, e.g. `greet`. A command the
+ * bindings do not generate has no accessor to record, so it keeps the raw Tauri command
+ * name the frontend passed to `invoke` — which is not cased like an accessor.
+ *
+ * @typedef {object} MockCall
+ * @property {string} command The generated command accessor, e.g. `greet`, or, for a
+ * command the bindings don't generate, its raw Tauri command name.
+ * @property {unknown} args The arguments `invoke` received, not a copy; `{}` when the
+ * generated `commands` accessor was called without arguments.
+ */
+
+/**
+ * The handle `mockCommands` returns for the handlers it installed.
+ *
+ * @typedef {object} MockCommandsHandle
+ * @property {readonly MockCall[]} calls Every call observed since this handle's handlers
+ * were installed, oldest first. The array is live, so it keeps growing for as long as
+ * those handlers stay installed.
+ * @property {() => void} clear Drop the recorded calls. The handlers stay installed.
+ */
+
+/**
  * Install typed mock handlers for the generated commands.
  *
  * Handlers are installed through `@tauri-apps/api/mocks`'s `mockIPC`, so the application
- * under test keeps importing the real `commands` object and still runs the argument and
- * result transforms around each call.
+ * under test keeps importing the real `commands` object and still runs the result transform
+ * and channel mapping the bindings wrap around each call.
  *
  * A handler receives the command's arguments and returns its success value; throw (or
  * return a rejected promise) to make the command fail. A command with no handler rejects
  * with an error rather than resolving `undefined`, so a test can't pass by accident.
  *
+ * The returned handle records every call these handlers observe, so a test can assert
+ * what was invoked:
+ *
+ * ```ts
+ * const calls = mockCommands({ greet: ({ myName }) => `Hello, ${myName}!` });
+ * await commands.greet("Brendan");
+ * expect(calls.calls).toEqual([{ command: "greet", args: { myName: "Brendan" } }]);
+ * ```
+ *
+ * `calls` is the live history, oldest first, and grows for as long as these handlers stay
+ * installed. Each entry holds the `commands` accessor that was called and the arguments
+ * `invoke` received — not a copy, and not narrowed to an object, since a raw `invoke` may
+ * pass Tauri's array or buffer payload shapes. `clear()` empties it without uninstalling
+ * anything. Every call is recorded before it is dispatched, including one that fails
+ * because it has no handler or because its handler throws. A command the bindings do not
+ * generate is recorded under its raw Tauri command name, since it has no `commands`
+ * accessor.
+ *
+ * Calling `mockCommands` again installs a fresh set of handlers and returns a fresh handle
+ * with an empty history; the previous handle keeps its calls but stops growing.
+ *
  * Tauri's event mocking is enabled as part of the install (`shouldMockEvents`), so
- * `events` keeps working under test without a second installer fighting this one. Note
- * that Tauri's own mock does not implement `emitTo`, which resolves without reaching any
- * listener. Call `clearMocks` from `@tauri-apps/api/mocks` between tests.
+ * `events` and `tauriEvents` keep working under test without a second installer fighting
+ * this one, and the event plugin's internal invokes never reach the record. Note that
+ * Tauri's own mock does not implement `emitTo`, which resolves without reaching any
+ * listener. Call `clearMocks` from `@tauri-apps/api/mocks` between tests; it uninstalls
+ * the handlers but leaves a handle's history alone.
  *
  * @param {Partial<MockCommandHandlers>} [handlers]
+ * @returns {MockCommandsHandle}
  */
 export function mockCommands(handlers = {}) {
     // A copy with no prototype, so a command named after an `Object.prototype` member
@@ -54,13 +236,23 @@ export function mockCommands(handlers = {}) {
     /** @type {Partial<MockCommandHandlers>} */
     const mockHandlers = Object.create(null);
     Object.assign(mockHandlers, handlers);
-    return __TAURI_MOCK_IPC((cmd, args) => {
+    /** @type {MockCall[]} */
+    const calls = [];
+    __TAURI_MOCK_IPC((cmd, args) => {
         switch (cmd) {
-            case "greet": return mockCommandHandler(mockHandlers.greet, "greet", args);
-            case "unit_command": return mockCommandHandler(mockHandlers["unit-command"], "unit_command", args);
-            default: throw new Error(`No mock handler registered for command '${cmd}'`);
+            case "greet": calls.push({ command: "greet", args }); return mockCommandHandler(mockHandlers.greet, "greet", args);
+            case "unit_command": calls.push({ command: "unit-command", args }); return mockCommandHandler(mockHandlers["unit-command"], "unit_command", args);
+            default:
+                calls.push({ command: cmd, args });
+                throw new Error(`No mock handler registered for command '${cmd}'`);
         }
     }, { shouldMockEvents: true });
+    return Object.freeze({
+        calls,
+        clear: () => {
+            calls.length = 0;
+        },
+    });
 }
 
 /**

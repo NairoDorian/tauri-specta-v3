@@ -1,41 +1,34 @@
 //! Regression tests for raw IPC binding types.
-//!
-//! Off in this Tauri 3 fork: they need `specta::Type` for `tauri::ipc::Request`
-//! and `tauri::ipc::Response`, which upstream gets from a patched Tauri 2
-//! (tauri-apps/tauri#16374). Tauri 3.0.0-alpha.6 has no such impls, so the
-//! commands below cannot be collected. Re-enable when Tauri 3 ships them.
-#![cfg(all(feature = "typescript", feature = "derive", tauri_ipc_specta_types))]
+#![cfg(all(feature = "typescript", feature = "derive"))]
 #![allow(missing_docs, dead_code, clippy::unwrap_used)]
 
 use tauri::test::MockRuntime;
 use tauri_specta::{Builder, LanguageExt, collect_commands};
 
 #[tauri::command]
-#[specta::specta]
 fn ipc(request: tauri::ipc::Request<'_>) -> tauri::ipc::Response {
     let _ = request;
     tauri::ipc::Response::new(Vec::<u8>::new())
 }
 
 #[tauri::command]
-#[specta::specta]
 fn fallible_ipc() -> Result<tauri::ipc::Response, String> {
     Ok(tauri::ipc::Response::new("null".to_string()))
 }
 
 #[tauri::command]
-#[specta::specta]
 fn mixed(todo: String, request: tauri::ipc::Request<'_>) -> String {
     let _ = request;
     todo
 }
 
 #[tauri::command]
-#[specta::specta]
+fn unnamed_request(_: tauri::ipc::Request<'_>) {}
+
+#[tauri::command]
 fn no_args() {}
 
 #[tauri::command]
-#[specta::specta]
 fn option_names(options: String, invoke_options: String) {
     let _ = (options, invoke_options);
 }
@@ -93,6 +86,27 @@ fn raw_ipc_uses_sdk_request_types_and_unknown_response() {
     );
     assert!(
         !js.contains("TAURI_REQUEST") && !js.contains("TAURI_RESPONSE"),
+        "{js}"
+    );
+}
+
+#[test]
+fn raw_request_does_not_require_an_argument_name() {
+    let builder = Builder::<MockRuntime>::new().commands(collect_commands![unnamed_request]);
+    let ts = export(
+        &builder,
+        specta_typescript::Typescript::default(),
+        "unnamed.ts",
+    );
+    assert!(
+        ts.contains(r#"unnamedRequest: (request: InvokeArgs, options?: InvokeOptions) => __TAURI_INVOKE<void>("unnamed_request", Array.isArray(request) ? new Uint8Array(request) : request, options)"#),
+        "{ts}"
+    );
+
+    let js = export(&builder, specta_typescript::JSDoc::default(), "unnamed.js");
+    assert!(js.contains("@param {InvokeArgs} request"), "{js}");
+    assert!(
+        js.contains(r#"__TAURI_INVOKE("unnamed_request", Array.isArray(request) ? new Uint8Array(request) : request, options)"#),
         "{js}"
     );
 }

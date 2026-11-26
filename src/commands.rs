@@ -1,24 +1,53 @@
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    sync::Arc,
+use std::{borrow::Cow, collections::BTreeSet, fmt, sync::Arc};
+
+use std::future::Future;
+
+use specta::Type;
+use specta::{
+    Types,
+    datatype::{DataType, Deprecated, Reference},
+};
+use tauri::{
+    Runtime,
+    ipc::{CommandScope, GlobalScope, Invoke, ScopeObject},
 };
 
-use specta::{Types, datatype};
-use tauri::{Runtime, ipc::Invoke};
+/// A command as seen by the binding exporters.
+///
+/// Produced by `collect_commands!` and exposed through
+/// [`BuilderConfiguration::commands`](crate::BuilderConfiguration::commands).
+#[derive(Debug, Clone)]
+pub struct Command {
+    /// The command name Tauri's invoke handler accepts, after
+    /// `#[tauri::command(rename = "...")]`. The plugin prefix is added at export time.
+    pub name: Cow<'static, str>,
+    /// The Rust identifier the frontend accessor is derived from.
+    pub accessor: Cow<'static, str>,
+    /// The arguments the frontend sends, in declaration order.
+    pub args: Vec<CommandArg>,
+    /// The command result, or `None` when it resolves to `void`.
+    pub result: Option<DataType>,
+    /// Rust-doc comments on the command.
+    pub docs: Cow<'static, str>,
+    /// Rust deprecation metadata on the command.
+    pub deprecated: Option<Deprecated>,
+}
+
+/// A frontend-visible command argument.
+#[derive(Debug, Clone)]
+pub struct CommandArg {
+    /// The key Tauri reads this argument from, after `rename_all`.
+    pub name: Cow<'static, str>,
+    /// The frontend type of the argument.
+    pub ty: DataType,
+}
 
 /// The command metadata produced by a [`CommandTypeCollector`].
 #[doc(hidden)]
 #[derive(Default)]
 pub struct CollectedCommands {
-    /// The Specta functions for the registered commands. Each function's name is the
-    /// effective Tauri command name accepted by [`tauri::generate_handler`].
-    pub functions: Vec<datatype::Function>,
-    /// Maps the effective Tauri name of a renamed command back to the Rust identifier
-    /// its generated frontend accessor is derived from. Empty for commands without a
-    /// rename.
-    pub accessor_names: BTreeMap<Cow<'static, str>, Cow<'static, str>>,
+    /// The registered commands, in registration order.
+    pub commands: Vec<Command>,
 }
 
 /// Type-erased collector used by [`Commands`] to register command metadata.
@@ -45,10 +74,7 @@ impl<R: Runtime> Default for Commands<R> {
     fn default() -> Self {
         Self(
             Arc::new(tauri::generate_handler![]),
-            Arc::new(|types: &mut Types| CollectedCommands {
-                functions: ::specta::function::collect_functions![](types),
-                accessor_names: BTreeMap::new(),
-            }),
+            Arc::new(|_: &mut Types| CollectedCommands::default()),
         )
     }
 }
@@ -65,72 +91,344 @@ impl<R: Runtime> Clone for Commands<R> {
 /// mistake is caught in release builds too — `export` is usually `#[cfg(debug_assertions)]`.
 /// Collisions between *differently* named commands are a separate, export-time check,
 /// because the accessor they share depends on the final `function_casing`.
-pub(crate) fn duplicate_command_name(commands: &[datatype::Function]) -> Option<&str> {
+pub(crate) fn duplicate_command_name(commands: &[Command]) -> Option<&str> {
     let mut seen = BTreeSet::new();
     for command in commands {
-        if !seen.insert(command.name()) {
-            return Some(command.name());
+        if !seen.insert(command.name.as_ref()) {
+            return Some(command.name.as_ref());
         }
     }
     None
 }
 
-/// Applies each command's effective Tauri command name to its collected Specta function.
+/// A Tauri command whose frontend types are inferred from its Rust signature.
 ///
-/// `#[tauri::command(rename = "...")]` changes the name the invoke handler matches against,
-/// while `#[specta::specta]` names the function after its Rust identifier. `renames` pairs
-/// the Rust identifier with the name Tauri's hidden `__tauri_command_name_*!()` macro
-/// reports, so the generated bindings invoke the name the handler actually accepts.
-///
-/// The rename is applied by matching on the *original* Specta name, so the order of
-/// `renames` can't shift a name onto the wrong function.
-///
-/// # Panics
-///
-/// Panics if a renamed command doesn't correspond to exactly one collected function, rather
-/// than silently leaving the binding with a name the handler rejects.
-#[allow(clippy::panic)]
-pub(crate) fn apply_command_renames(
-    collected: &mut CollectedCommands,
-    renames: &[(&'static str, &'static str)],
-) {
-    // Snapshot the names so a rename can't match a function an earlier rename already
-    // touched.
-    let original: Vec<Cow<'static, str>> = collected
-        .functions
-        .iter()
-        .map(|function| function.name.clone())
-        .collect();
+/// Implemented for function references that Tauri's `#[tauri::command]` macro accepts,
+/// so commands only need `#[tauri::command]`. Every argument the frontend sends, and
+/// the result, must implement `specta::Type`, and a command may take at most ten
+/// arguments. The marker parameter keeps the argument-count and result-kind
+/// implementations from overlapping.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "this function cannot be collected as a Tauri command",
+    label = "not a supported command signature",
+    note = "commands may take at most ten arguments",
+    note = "commands must be free functions whose argument and result types implement `specta::Type`"
+)]
+pub trait CommandSignature<TMarker> {
+    /// The command's argument tuple.
+    type Args;
+    /// Marker types selecting an argument implementation per position.
+    type ArgMarkers;
+    /// The command's declared result type.
+    type Result;
+    /// Marker selecting a synchronous or asynchronous result implementation.
+    type ResultMarker;
 
-    for (rust_name, tauri_name) in renames {
-        // Without an explicit `rename`, Tauri's name is the Rust identifier and the
-        // Specta name already matches.
-        if rust_name == tauri_name {
-            continue;
-        }
+    /// Convert the command into binding metadata using Tauri's command metadata.
+    fn into_command(
+        self,
+        metadata: tauri::ipc::CommandMetadata,
+        accessor: Cow<'static, str>,
+        types: &mut Types,
+    ) -> Command
+    where
+        Self::Args: CommandArguments<Self::ArgMarkers>,
+        Self::Result: CommandResult<Self::ResultMarker>;
+}
 
-        let mut matched = None;
-        for (index, name) in original.iter().enumerate() {
-            if name == rust_name {
-                if matched.is_some() {
-                    panic!(
-                        "Command '{rust_name}' is registered more than once, so its `#[tauri::command(rename = \"{tauri_name}\")]` can't be applied unambiguously."
-                    );
-                }
-                matched = Some(index);
-            }
-        }
+/// All of a command's arguments, as a tuple.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "one or more Tauri command arguments cannot be exported by specta",
+    note = "derive or implement `specta::Type` for every argument the frontend sends",
+    note = "`State`, `AppHandle`, `Window`, `Webview`, `WebviewWindow`, `CommandScope` and `GlobalScope` are injected by Tauri and are not sent from the frontend"
+)]
+pub trait CommandArguments<TMarker> {
+    /// One entry per argument, in declaration order. `None` marks an injected argument.
+    fn to_datatypes(types: &mut Types) -> Vec<Option<DataType>>;
+}
 
-        match matched {
-            Some(index) => {
-                collected.functions[index].name = Cow::Borrowed(tauri_name);
-                collected
-                    .accessor_names
-                    .insert(Cow::Borrowed(tauri_name), Cow::Borrowed(rust_name));
-            }
-            None => panic!(
-                "Command '{rust_name}' has `#[tauri::command(rename = \"{tauri_name}\")]`, but no collected command has that name. Make sure the command is also annotated with `#[specta::specta]`."
-            ),
-        }
+/// A single command argument.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be exported as a Tauri command argument",
+    label = "this argument is missing `specta::Type`",
+    note = "derive or implement `specta::Type` for `{Self}`",
+    note = "if Tauri injects this argument instead of reading it from the invoke payload, please report it: tauri-specta does not know about it"
+)]
+pub trait CommandArgument<TMarker> {
+    /// `None` when Tauri injects the argument rather than sending it from the frontend.
+    fn to_datatype(types: &mut Types) -> Option<DataType>;
+}
+
+/// Marker for arguments the frontend sends.
+#[doc(hidden)]
+pub enum SpectaArgumentMarker {}
+
+impl<T: Type> CommandArgument<SpectaArgumentMarker> for T {
+    fn to_datatype(types: &mut Types) -> Option<DataType> {
+        Some(T::definition(types))
     }
 }
+
+/// Marker for arguments Tauri injects.
+#[doc(hidden)]
+pub enum InjectedArgumentMarker {}
+
+impl<T: Send + Sync + 'static> CommandArgument<InjectedArgumentMarker> for tauri::State<'_, T> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
+        None
+    }
+}
+
+impl<R: Runtime> CommandArgument<InjectedArgumentMarker> for tauri::AppHandle<R> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
+        None
+    }
+}
+
+impl<R: Runtime> CommandArgument<InjectedArgumentMarker> for tauri::Window<R> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
+        None
+    }
+}
+
+impl<R: Runtime> CommandArgument<InjectedArgumentMarker> for tauri::Webview<R> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
+        None
+    }
+}
+
+impl<R: Runtime> CommandArgument<InjectedArgumentMarker> for tauri::WebviewWindow<R> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
+        None
+    }
+}
+
+impl<T: ScopeObject> CommandArgument<InjectedArgumentMarker> for CommandScope<T> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
+        None
+    }
+}
+
+impl<T: ScopeObject> CommandArgument<InjectedArgumentMarker> for GlobalScope<T> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
+        None
+    }
+}
+
+/// A command's declared result type.
+///
+/// The diagnostic deliberately avoids `{Self}` in its notes. For an `async fn` the
+/// failing type is the opaque future, so advice phrased as "implement `specta::Type`
+/// for `{Self}`" would ask the author to implement a trait for `impl Future<...>`.
+/// The type they actually have to fix is the future's output, which rustc prints
+/// after `Output =`.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "this command's result cannot be described for the generated bindings",
+    label = "needs a `specta::Type` impl",
+    note = "add `#[derive(specta::Type)]`, or implement `specta::Type` by hand",
+    note = "`serde::Serialize` only lets Tauri send the value; tauri-specta also needs the type's shape to write the bindings",
+    note = "for an `async fn`, the type to fix is the one after `Output =`"
+)]
+pub trait CommandResult<TMarker> {
+    /// `None` for a result that is not sent to the frontend (a top-level unit).
+    fn to_datatype(types: &mut Types) -> Option<DataType>;
+}
+
+/// Marker for a synchronous result.
+#[doc(hidden)]
+pub enum SpectaResultMarker {}
+
+impl<T: Type> CommandResult<SpectaResultMarker> for T {
+    fn to_datatype(types: &mut Types) -> Option<DataType> {
+        top_level_unit_as_void(T::definition(types))
+    }
+}
+
+/// Marker for an `async fn` result, whose value is the future's output.
+#[doc(hidden)]
+pub enum FutureResultMarker {}
+
+impl<F> CommandResult<FutureResultMarker> for F
+where
+    F: Future,
+    F::Output: AsyncCommandResult,
+{
+    fn to_datatype(types: &mut Types) -> Option<DataType> {
+        F::Output::to_datatype(types)
+    }
+}
+
+/// The awaited output of an `async fn` command.
+///
+/// This exists separately from [`CommandResult`] because the marker parameter picks
+/// between the synchronous and asynchronous shapes before the output is involved.
+///
+/// It has no `#[diagnostic::on_unimplemented]` on purpose. rustc reports the
+/// outermost failing obligation, so a missing `specta::Type` here always surfaces as
+/// `impl Future<Output = T>: CommandResult<_>` and never reaches this trait. The
+/// diagnostic on [`CommandResult`] is the one that has to explain the fix.
+#[doc(hidden)]
+pub trait AsyncCommandResult {
+    /// `None` for a top-level unit, which Tauri sends as `void`.
+    fn to_datatype(types: &mut Types) -> Option<DataType>;
+}
+
+impl<T: Type> AsyncCommandResult for T {
+    fn to_datatype(types: &mut Types) -> Option<DataType> {
+        top_level_unit_as_void(T::definition(types))
+    }
+}
+
+fn top_level_unit_as_void(dt: DataType) -> Option<DataType> {
+    match &dt {
+        DataType::Tuple(tuple) if tuple.elements.is_empty() => None,
+        _ => Some(dt),
+    }
+}
+
+fn command_from_parts(
+    metadata: tauri::ipc::CommandMetadata,
+    accessor: Cow<'static, str>,
+    arg_types: Vec<Option<DataType>>,
+    result: Option<DataType>,
+    types: &Types,
+) -> Command {
+    // Zip before filtering: `metadata.arguments` lists every argument, including the
+    // ones Tauri injects, so dropping injected types first would shift the names.
+    let args = metadata
+        .arguments
+        .iter()
+        .zip(arg_types)
+        .filter_map(|(name, ty)| {
+            let ty = ty?;
+            let name = if !name.is_empty() {
+                *name
+            } else if let DataType::Reference(Reference::Named(reference)) = &ty
+                && types.get(reference).is_some_and(|ndt| {
+                    ndt.name == "TAURI_REQUEST" && ndt.module_path.starts_with("tauri::")
+                })
+            {
+                // Tauri supplies the whole request regardless of the argument pattern.
+                // This is a frontend parameter name, not a key in the IPC payload.
+                "request"
+            } else {
+                return None;
+            };
+            Some(CommandArg {
+                name: Cow::Borrowed(name),
+                ty,
+            })
+        })
+        .collect();
+
+    Command {
+        name: Cow::Borrowed(metadata.name),
+        accessor,
+        args,
+        result,
+        docs: Cow::Borrowed(metadata.docs),
+        deprecated: metadata.deprecated.map(|deprecated| {
+            let mut out = Deprecated::new();
+            out.note = deprecated.note.map(Cow::Borrowed);
+            out.since = deprecated.since.map(Cow::Borrowed);
+            out
+        }),
+    }
+}
+
+macro_rules! impl_command_signature {
+    () => {
+        impl CommandArguments<()> for () {
+            fn to_datatypes(_: &mut Types) -> Vec<Option<DataType>> {
+                Vec::new()
+            }
+        }
+
+        impl<F, TResult, TResultMarker> CommandSignature<(TResult, TResultMarker)> for F
+        where
+            for<'a> &'a F: Fn() -> TResult,
+        {
+            type Args = ();
+            type ArgMarkers = ();
+            type Result = TResult;
+            type ResultMarker = TResultMarker;
+
+            fn into_command(
+                self,
+                metadata: tauri::ipc::CommandMetadata,
+                accessor: Cow<'static, str>,
+                types: &mut Types,
+            ) -> Command
+            where
+                Self::Args: CommandArguments<Self::ArgMarkers>,
+                Self::Result: CommandResult<Self::ResultMarker>,
+            {
+                let _ = self;
+                command_from_parts(
+                    metadata,
+                    accessor,
+                    Vec::new(),
+                    Self::Result::to_datatype(types),
+                    types,
+                )
+            }
+        }
+    };
+    ($($ty:ident : $marker:ident),+) => {
+        impl<$($ty, $marker),+> CommandArguments<($($marker,)+)> for ($($ty,)+)
+        where
+            $($ty: CommandArgument<$marker>,)+
+        {
+            fn to_datatypes(types: &mut Types) -> Vec<Option<DataType>> {
+                vec![$($ty::to_datatype(types)),+]
+            }
+        }
+
+        impl<F, TResult, TResultMarker, $($ty, $marker),+>
+            CommandSignature<($($ty, $marker,)+ TResult, TResultMarker)> for F
+        where
+            for<'a> &'a F: Fn($($ty),+) -> TResult,
+        {
+            type Args = ($($ty,)+);
+            type ArgMarkers = ($($marker,)+);
+            type Result = TResult;
+            type ResultMarker = TResultMarker;
+
+            fn into_command(
+                self,
+                metadata: tauri::ipc::CommandMetadata,
+                accessor: Cow<'static, str>,
+                types: &mut Types,
+            ) -> Command
+            where
+                Self::Args: CommandArguments<Self::ArgMarkers>,
+                Self::Result: CommandResult<Self::ResultMarker>,
+            {
+                let _ = self;
+                command_from_parts(
+                    metadata,
+                    accessor,
+                    Self::Args::to_datatypes(types),
+                    Self::Result::to_datatype(types),
+                    types,
+                )
+            }
+        }
+    };
+}
+
+impl_command_signature!();
+impl_command_signature!(T1: M1);
+impl_command_signature!(T1: M1, T2: M2);
+impl_command_signature!(T1: M1, T2: M2, T3: M3);
+impl_command_signature!(T1: M1, T2: M2, T3: M3, T4: M4);
+impl_command_signature!(T1: M1, T2: M2, T3: M3, T4: M4, T5: M5);
+impl_command_signature!(T1: M1, T2: M2, T3: M3, T4: M4, T5: M5, T6: M6);
+impl_command_signature!(T1: M1, T2: M2, T3: M3, T4: M4, T5: M5, T6: M6, T7: M7);
+impl_command_signature!(T1: M1, T2: M2, T3: M3, T4: M4, T5: M5, T6: M6, T7: M7, T8: M8);
+impl_command_signature!(T1: M1, T2: M2, T3: M3, T4: M4, T5: M5, T6: M6, T7: M7, T8: M8, T9: M9);
+impl_command_signature!(T1: M1, T2: M2, T3: M3, T4: M4, T5: M5, T6: M6, T7: M7, T8: M8, T9: M9, T10: M10);

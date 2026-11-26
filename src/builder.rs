@@ -1,11 +1,11 @@
-use std::{any::TypeId, borrow::Cow, collections::BTreeMap, path::Path};
+use std::{any::TypeId, borrow::Cow, collections::BTreeMap, fmt, path::Path};
 
-use crate::{Casing, Commands, EventRegistry, Events, LanguageExt, event::EventRegistryMeta};
-use serde::Serialize;
-use specta::{
-    Type, Types,
-    datatype::{Function, Reference},
+use crate::{
+    Casing, Command, Commands, EventRegistry, Events, LanguageExt, event::EventRegistryMeta,
+    name::resolve_tauri_event_name,
 };
+use serde::Serialize;
+use specta::{Type, Types, datatype::Reference};
 #[cfg(any(feature = "javascript", feature = "typescript"))]
 use specta_typescript::semantic;
 use tauri::{Manager, Runtime, ipc::Invoke};
@@ -111,11 +111,53 @@ pub enum ErrorHandlingMode {
 ///     .run(tauri::test::mock_context(tauri::test::noop_assets()))
 ///     .expect("error while running tauri application");
 /// ```
-#[derive(Debug)]
 #[non_exhaustive]
 pub struct Builder<R: Runtime> {
     commands: Commands<R>,
     cfg: BuilderConfiguration,
+    type_registrations: Vec<TypeRegistration>,
+}
+
+impl<R: Runtime> fmt::Debug for Builder<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Builder")
+            .field("commands", &self.commands)
+            .field("cfg", &self.cfg)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+enum TypeRegistration {
+    Commands,
+    Events(Events),
+    ExplicitType(fn(&mut Types)),
+    ExplicitTypes(Types),
+}
+
+impl TypeRegistration {
+    #[allow(clippy::panic)]
+    fn apply<R: Runtime>(&self, commands: &Commands<R>, cfg: &mut BuilderConfiguration) {
+        match self {
+            Self::Commands => {
+                cfg.commands = (commands.1)(&mut cfg.types).commands;
+                if let Some(name) = crate::commands::duplicate_command_name(&cfg.commands) {
+                    panic!(
+                        "Command '{name}' is registered multiple times. Remove the duplicate registration."
+                    );
+                }
+            }
+            Self::Events(events) => {
+                cfg.events = events
+                    .0
+                    .iter()
+                    .map(|(name, build)| (*name, build(&mut cfg.types)))
+                    .collect();
+            }
+            Self::ExplicitType(register) => register(&mut cfg.types),
+            Self::ExplicitTypes(types) => cfg.types.extend(types),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -125,11 +167,7 @@ pub struct BuilderConfiguration {
     /// Plugin name used when generating bindings for plugin commands.
     pub plugin_name: Option<&'static str>,
     /// Commands registered on the builder.
-    pub commands: Vec<Function>,
-    /// Maps each renamed command's effective Tauri name back to the Rust identifier its
-    /// generated frontend accessor is derived from. Populated for commands that use
-    /// `#[tauri::command(rename = "...")]`.
-    pub command_accessor_names: BTreeMap<Cow<'static, str>, Cow<'static, str>>,
+    pub commands: Vec<Command>,
     /// Error handling mode used by generated bindings.
     pub error_handling: ErrorHandlingMode,
     /// Event names mapped to their type metadata.
@@ -159,10 +197,8 @@ impl BuilderConfiguration {
     ///
     /// This is the command's Rust identifier even when `#[tauri::command(rename = "...")]`
     /// changed the IPC name the bindings invoke.
-    pub fn command_accessor_name<'a>(&'a self, command: &'a Function) -> &'a str {
-        self.command_accessor_names
-            .get(command.name())
-            .map_or_else(|| command.name(), |name| name.as_ref())
+    pub fn command_accessor_name<'a>(&'a self, command: &'a Command) -> &'a str {
+        &command.accessor
     }
 }
 
@@ -171,6 +207,7 @@ impl<R: Runtime> Default for Builder<R> {
         Self {
             commands: Default::default(),
             cfg: Default::default(),
+            type_registrations: Vec::new(),
         }
     }
 }
@@ -180,6 +217,7 @@ impl<R: Runtime> Clone for Builder<R> {
         Self {
             commands: self.commands.clone(),
             cfg: self.cfg.clone(),
+            type_registrations: self.type_registrations.clone(),
         }
     }
 }
@@ -188,6 +226,32 @@ impl<R: Runtime> Builder<R> {
     /// Construct a new Tauri Specta builder.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn register(mut self, registration: TypeRegistration) -> Self {
+        use TypeRegistration::{Commands, Events};
+
+        if matches!(&registration, Commands | Events(_))
+            && let Some(index) = self.type_registrations.iter().position(|previous| {
+                matches!(
+                    (previous, &registration),
+                    (Commands, Commands) | (Events(_), Events(_))
+                )
+            })
+        {
+            // Types has no way to remove one registration's definitions or roots.
+            // Replay the surviving registrations in order: the first definition wins
+            // when multiple registrations supply the same type.
+            self.type_registrations.remove(index);
+            self.cfg.types = Types::default();
+            for previous in &self.type_registrations {
+                previous.apply(&self.commands, &mut self.cfg);
+            }
+        }
+
+        registration.apply(&self.commands, &mut self.cfg);
+        self.type_registrations.push(registration);
+        self
     }
 
     /// Set the name of the current plugin name.
@@ -200,7 +264,8 @@ impl<R: Runtime> Builder<R> {
 
     /// Register commands with the builder.
     ///
-    /// **WARNING:** This method will overwrite any previously registered commands.
+    /// This replaces any previously registered commands, including types collected
+    /// only for those commands.
     ///
     /// # Panics
     ///
@@ -215,32 +280,21 @@ impl<R: Runtime> Builder<R> {
     /// use tauri_specta::{Builder, collect_commands};
     ///
     /// #[tauri::command]
-    /// #[specta::specta]
     /// fn hello_world(my_name: String) -> String {
     ///     format!("Hello, {my_name}! You've been greeted from Rust!")
     /// }
     ///
-    /// let mut builder = Builder::<tauri::DynRuntime>::new().commands(collect_commands![hello_world]);
+    /// let mut builder = Builder::<tauri::Wry>::new().commands(collect_commands![hello_world]);
     /// ```
-    #[allow(clippy::panic)]
     pub fn commands(mut self, commands: Commands<R>) -> Self {
-        let collected = (commands.1)(&mut self.cfg.types);
-        self.cfg.commands = collected.functions;
-        self.cfg.command_accessor_names = collected.accessor_names;
-        if let Some(name) = crate::commands::duplicate_command_name(&self.cfg.commands) {
-            panic!(
-                "Command '{name}' is registered multiple times. Remove the duplicate registration."
-            );
-        }
-        Self {
-            commands,
-            cfg: self.cfg,
-        }
+        self.commands = commands;
+        self.register(TypeRegistration::Commands)
     }
 
     /// Register events with the builder.
     ///
-    /// **WARNING:** This method will overwrite any previously registered events.
+    /// This replaces any previously registered events, including types collected
+    /// only for those events. Use [`Events::merge`] to combine event collections first.
     ///
     /// # Example
     ///
@@ -252,15 +306,10 @@ impl<R: Runtime> Builder<R> {
     /// #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
     /// pub struct DemoEvent(String);
     ///
-    /// let mut builder = Builder::<tauri::DynRuntime>::new().events(collect_events![DemoEvent]);
+    /// let mut builder = Builder::<tauri::Wry>::new().events(collect_events![DemoEvent]);
     /// ```
-    pub fn events(mut self, events: Events) -> Self {
-        self.cfg.events = events
-            .0
-            .iter()
-            .map(|(k, build)| (*k, build(&mut self.cfg.types)))
-            .collect();
-        self
+    pub fn events(self, events: Events) -> Self {
+        self.register(TypeRegistration::Events(events))
     }
 
     /// Export a new type with the frontend.
@@ -279,11 +328,12 @@ impl<R: Runtime> Builder<R> {
     ///     a: String
     /// }
     ///
-    /// let mut builder = Builder::<tauri::DynRuntime>::new().typ::<MyStruct>();
+    /// let mut builder = Builder::<tauri::Wry>::new().typ::<MyStruct>();
     /// ```
-    pub fn typ<T: Type>(mut self) -> Self {
-        self.cfg.types.register_mut::<T>();
-        self
+    pub fn typ<T: Type>(self) -> Self {
+        self.register(TypeRegistration::ExplicitType(|types| {
+            types.register_mut::<T>();
+        }))
     }
 
     /// Export a group of types to the frontend.
@@ -296,11 +346,10 @@ impl<R: Runtime> Builder<R> {
     /// use tauri_specta::Builder;
     /// use specta::{Type, Types};
     ///
-    /// let mut builder = Builder::<tauri::DynRuntime>::new().types(&Types::default());
+    /// let mut builder = Builder::<tauri::Wry>::new().types(&Types::default());
     /// ```
-    pub fn types(mut self, types: &Types) -> Self {
-        self.cfg.types.extend(types);
-        self
+    pub fn types(self, types: &Types) -> Self {
+        self.register(TypeRegistration::ExplicitTypes(types.clone()))
     }
 
     /// Export a constant value to the frontend.
@@ -312,7 +361,7 @@ impl<R: Runtime> Builder<R> {
     /// ```rust
     /// use tauri_specta::Builder;
     ///
-    /// let mut builder = Builder::<tauri::DynRuntime>::new().constant("CONSTANT_NAME","ANY_CONSTANT_VALUE");
+    /// let mut builder = Builder::<tauri::Wry>::new().constant("CONSTANT_NAME","ANY_CONSTANT_VALUE");
     /// ```
     #[track_caller]
     pub fn constant<T: Serialize>(mut self, k: impl Into<Cow<'static, str>>, v: T) -> Self {
@@ -360,7 +409,7 @@ impl<R: Runtime> Builder<R> {
     ///     }
     /// }"#;
     ///
-    /// Builder::<tauri::DynRuntime>::default()
+    /// Builder::<tauri::Wry>::default()
     ///  .typed_error_impl(TYPED_ERROR_IMPL);
     /// ```
     pub fn typed_error_impl(mut self, runtime: impl Into<Cow<'static, str>>) -> Self {
@@ -410,13 +459,13 @@ impl<R: Runtime> Builder<R> {
     ///
     /// Command argument names are separate because they are part of Tauri's
     /// runtime IPC contract. To rename arguments, configure the command itself
-    /// and keep `#[tauri::command(rename_all = "...")]` aligned with
-    /// `#[specta(rename_all = "...")]`. This method never renames arguments.
+    /// and `#[tauri::command(rename_all = "...")]` is applied by the generated
+    /// bindings. This method never renames arguments.
     ///
     /// ```rust
     /// use tauri_specta::{Builder, Casing};
     ///
-    /// let mut builder = Builder::<tauri::DynRuntime>::new().function_casing(Casing::SnakeCase);
+    /// let mut builder = Builder::<tauri::Wry>::new().function_casing(Casing::SnakeCase);
     /// ```
     pub fn function_casing(mut self, casing: Casing) -> Self {
         self.cfg.function_casing = casing;
@@ -429,6 +478,9 @@ impl<R: Runtime> Builder<R> {
     /// generated bindings, so a frontend test can stub commands without hand-writing
     /// a module that satisfies the bindings' types. Refer to the crate docs for what
     /// the generated helpers do.
+    ///
+    /// The helper also installs Tauri's event mock, so `events` and `tauriEvents` deliver
+    /// under test. That is what `.mocks()` is for on an export with no commands to stub.
     ///
     /// Requires `@tauri-apps/api` v2.7 or newer, which is where `mockIPC` gained
     /// the `shouldMockEvents` option the generated helper relies on.
@@ -443,7 +495,7 @@ impl<R: Runtime> Builder<R> {
     /// ```rust
     /// use tauri_specta::Builder;
     ///
-    /// let builder = Builder::<tauri::DynRuntime>::new().mocks();
+    /// let builder = Builder::<tauri::Wry>::new().mocks();
     /// ```
     pub fn mocks(mut self) -> Self {
         self.cfg.mocks = true;
@@ -459,6 +511,12 @@ impl<R: Runtime> Builder<R> {
     /// Mount all of the events in the builder onto a Tauri app.
     ///
     /// This should be called within [`tauri::Builder::setup`](tauri::Builder::setup) like the example below.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an event type is already mounted in a different namespace on this app.
+    /// Use a distinct Rust event type for each plugin or application namespace.
+    /// Mounting the same event type again in the same namespace is allowed.
     ///
     /// # Example
     ///
@@ -476,17 +534,27 @@ impl<R: Runtime> Builder<R> {
     ///     .run(tauri::test::mock_context(tauri::test::noop_assets()))
     ///     .expect("error while running tauri application");
     /// ```
+    #[allow(clippy::panic)]
     pub fn mount_events(&self, handle: &impl Manager<R>) {
         let registry = EventRegistry::get_or_manage(handle);
         let mut map = registry.0.write().expect("Failed to lock EventRegistry");
+        let plugin_name = self.cfg.plugin_name;
+
+        if let Some((name, previous)) = self.cfg.events.iter().find_map(|(&name, (tid, _))| {
+            let previous = map.get(tid)?.plugin_name;
+            (previous != plugin_name).then_some((name, previous))
+        }) {
+            // A rejected mount must leave the registry usable even if the caller catches the panic.
+            drop(map);
+            let previous = resolve_tauri_event_name(previous, name);
+            let requested = resolve_tauri_event_name(plugin_name, name);
+            panic!(
+                "Event type for '{previous}' is already mounted and cannot also be mounted as '{requested}' in the same Tauri app. Use a distinct Rust event type for each namespace."
+            );
+        }
 
         for (tid, _) in self.cfg.events.values() {
-            map.insert(
-                *tid,
-                EventRegistryMeta {
-                    plugin_name: self.cfg.plugin_name,
-                },
-            );
+            map.insert(*tid, EventRegistryMeta { plugin_name });
         }
     }
 
@@ -497,7 +565,7 @@ impl<R: Runtime> Builder<R> {
     /// use tauri_specta::{Builder, collect_commands, collect_events};
     /// use specta_typescript::Typescript;
     ///
-    /// let mut builder = Builder::<tauri::DynRuntime>::new()
+    /// let mut builder = Builder::<tauri::Wry>::new()
     ///     .commands(collect_commands![])
     ///     .events(collect_events![]);
     ///

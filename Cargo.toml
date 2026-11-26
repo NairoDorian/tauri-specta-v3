@@ -16,11 +16,16 @@ categories = ["web-programming", "asynchronous"]
 # `--no-deps` matters: RUSTDOCFLAGS applies to every crate rustdoc builds, and some
 # dependencies still gate removed nightly features behind `cfg(docsrs)`.
 [package.metadata."docs.rs"]
-all-features = true
+# `all-features` would add nothing here; the API is the same in every combination.
+features = ["derive", "javascript", "typescript"]
 
 [features]
-default = []
-derive = ["dep:tauri-specta-macros"]
+# Tauri v2 is the default: this pins `tauri` to 2.x so an unconstrained consumer
+# does not resolve the v3 prerelease that the dependency range also admits. Disable
+# default features and depend on Tauri v3 yourself to use v3.
+default = ["v2"]
+v2 = ["dep:tauri-specta-pin"]
+derive = []
 javascript = ["dep:specta-typescript"]
 typescript = ["dep:specta-typescript"]
 
@@ -29,9 +34,10 @@ workspace = true
 
 [dependencies]
 # Public
-specta = { workspace = true, features = ["function"] }
+specta.workspace = true
 specta-typescript = { workspace = true, optional = true }
-tauri-specta-macros = { version = "=2.0.0-rc.29", optional = true, path = "./macros" }
+tauri-specta-macros = { version = "=2.0.0-rc.29", path = "./macros" }
+tauri-specta-pin = { version = "0.1.0", optional = true, path = "./crates/tauri-specta-pin" }
 serde = "1"
 serde_json = "1"
 thiserror = "2"
@@ -39,32 +45,26 @@ tauri = { workspace = true, features = ["specta"] }
 
 # Private
 heck = "0.5"
-paste = "1"
 specta-serde = { workspace = true }
 specta-util = { workspace = true }
 
 [dev-dependencies]
-# Tauri 3 moved the Wry runtime into `tauri-runtime-wry`; the tests run on
-# `MockRuntime` (the `test` feature), so no runtime is needed here.
-tauri = { workspace = true, features = ["test"] }
+tauri = { version = "2", default-features = false, features = ["test", "wry"] }
 
 [workspace]
-# The example apps are upstream's Tauri 2 apps (`tauri::Builder` with the
-# built-in Wry runtime and the `wry` feature, both gone in Tauri 3), so this
-# fork keeps them out of the workspace rather than half-porting them. The
-# libraries and their test suites are what a Tauri 3 app consumes.
-members = ["crates/tauri-specta-query", "macros"]
-exclude = [
+exclude = ["tests/tauri-default", "tests/tauri-v3"]
+members = [
+  "crates/tauri-specta-query",
+  "crates/tauri-specta-pin",
   "examples/app/src-tauri",
   "examples/tanstack-query/src-tauri",
   "examples/custom-plugin/app/src-tauri",
   "examples/custom-plugin/plugin",
+  "macros",
 ]
 
 [workspace.lints.rust]
 unsafe_code = { level = "forbid", priority = -1 }
-# Set only once Tauri 3 implements specta::Type for its IPC types (tests/ipc_types.rs).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tauri_ipc_specta_types)'] }
 missing_docs = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
@@ -76,18 +76,21 @@ panic = { level = "warn", priority = -1 }
 todo = { level = "warn", priority = -1 }
 panic_in_result_fn = { level = "warn", priority = -1 }
 
-# Tauri 3: this fork exists because upstream tauri-specta publishes for Tauri 2
-# only. The workspace takes the newest 3.0 alphas; a consumer's lock decides the
-# exact release (ZER0 pins its whole Tauri family with `=`).
 [workspace.dependencies]
-tauri = { version = "3.0.0-alpha.6", default-features = false }
-tauri-build = { version = "3.0.0-alpha.4" }
-tauri-plugin = { version = "3.0.0-alpha.4" }
+# Bound v3 prereleases to the latest tested alpha. Applications select their Tauri major.
+tauri = { version = ">=2, <=3.0.0-alpha.6", default-features = false }
+tauri-build = { version = "2" }
+tauri-plugin = { version = "2" }
 specta = { version = "=2.0.0-rc.28", features = ["derive"] }
 specta-typescript = { version = "0.0.15" }
 specta-serde = { version = "0.0.15" }
 specta-util = { version = "0.0.15" }
 
-# No [patch.crates-io]: the Specta crates are published (rc.28), and upstream's
-# `tauri` patch is a Tauri 2 branch (tauri-apps/tauri#16374) that does not apply
-# to Tauri 3.
+[patch.crates-io]
+# Tauri's primary branch is `dev`. Pinned to the commit that contains #16374
+# (`ipc::Request`/`Response` Specta impls) and #15326 (command introspection), both
+# of which are unreleased. Tauri Specta cannot be released until Tauri ships them in
+# a minor; swap these for the published version then.
+tauri = { git = "https://github.com/tauri-apps/tauri", rev = "61a3537e040f1f5feb59a3892f061cef545da2c8" }
+tauri-macros = { git = "https://github.com/tauri-apps/tauri", rev = "61a3537e040f1f5feb59a3892f061cef545da2c8" }
+tauri-codegen = { git = "https://github.com/tauri-apps/tauri", rev = "61a3537e040f1f5feb59a3892f061cef545da2c8" }

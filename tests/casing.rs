@@ -10,13 +10,20 @@ use tauri::test::MockRuntime;
 use tauri_specta::{Builder, Casing, Event, collect_commands, collect_events};
 
 #[tauri::command]
-#[specta::specta]
 fn hello_world(my_name: String) -> String {
     format!("Hello, {my_name}!")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 struct MyDemoEvent(String);
+
+#[derive(Serialize, Deserialize, Type, Event)]
+#[tauri_specta(event_name = "job-done")]
+struct KebabEvent(String);
+
+#[derive(Serialize, Deserialize, Type, Event)]
+#[tauri_specta(event_name = "job_done")]
+struct SnakeEvent(String);
 
 fn export_to_string(builder: &Builder<MockRuntime>) -> String {
     let dir = std::env::temp_dir().join(format!(
@@ -85,5 +92,33 @@ fn function_casing_applies_to_events() {
     assert!(
         out.contains("my_demo_event: makeEvent"),
         "expected snake_case event accessor, got:\n{out}"
+    );
+}
+
+#[test]
+fn event_accessor_collisions_are_rejected() {
+    let builder = Builder::<MockRuntime>::new().events(collect_events![KebabEvent, SnakeEvent]);
+    let dir = std::env::temp_dir().join(format!(
+        "tauri_specta_event_collision_{}",
+        std::process::id()
+    ));
+    let err = builder
+        .export(Typescript::default(), dir.join("bindings.ts"))
+        .expect_err("the same accessor cannot represent two events");
+    let message = err.to_string();
+    assert!(
+        message.contains("'job-done'")
+            && message.contains("'job_done'")
+            && message.contains("'jobDone'"),
+        "{message}"
+    );
+
+    #[cfg(feature = "javascript")]
+    assert_eq!(
+        builder
+            .export(specta_typescript::JSDoc::default(), dir.join("bindings.js"))
+            .expect_err("JSDoc has the same event accessors")
+            .to_string(),
+        message
     );
 }

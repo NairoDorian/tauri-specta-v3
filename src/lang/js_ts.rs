@@ -8,8 +8,7 @@ use heck::ToLowerCamelCase;
 use specta::{
     Format, Type, Types,
     datatype::{
-        DataType, Field, Fields, Function, NamedDataType, NamedReferenceType, Primitive, Reference,
-        Struct,
+        DataType, Field, Fields, NamedDataType, NamedReferenceType, Primitive, Reference, Struct,
     },
 };
 use specta_serde::Phase;
@@ -47,7 +46,6 @@ impl LanguageExt for specta_typescript::Typescript {
                     },
                     TYPED_ERROR_ASSERTION_TS,
                     MAKE_EVENT_IMPL_TS,
-                    MAP_CHANNEL_IMPL_TS,
                 )
             })
             .export_to(path, &types, format)
@@ -82,7 +80,6 @@ impl LanguageExt for specta_typescript::JSDoc {
                     },
                     "",
                     MAKE_EVENT_IMPL_JS,
-                    MAP_CHANNEL_IMPL_JS,
                 )
             })
             .export_to(path, &types, format)
@@ -96,25 +93,27 @@ fn runtime(
     typed_error_impl: &str,
     typed_error_assertion: &str,
     make_event_impl: &str,
-    map_channel_impl: &str,
 ) -> Result<Cow<'static, str>, Error> {
     let enabled_commands = !cfg.commands.is_empty();
-    let enabled_events = !cfg.events.is_empty();
+    let has_user_events = !cfg.events.is_empty();
     let is_raw_request_used = cfg.commands.iter().any(|command| {
         command
-            .args()
+            .args
             .iter()
-            .any(|(_, dt)| is_ipc_type(dt, exporter.types, "TAURI_REQUEST"))
+            .any(|arg| is_ipc_type(&arg.ty, exporter.types, "TAURI_REQUEST"))
     });
-    // A builder with nothing registered has no commands to stub and no events to mock, so
-    // installing the IPC handler would only buy an import and an always-rejecting switch.
-    let enabled_mocks = cfg.mocks && (enabled_commands || enabled_events);
+    // `mockCommands` is not only a command stub: the `mockIPC` it installs is also what
+    // enables Tauri's event mock, so it has something to do even when there are no
+    // commands and no user events. The accessors for Tauri's own events are always
+    // emitted and need that mock under test.
+    let enabled_mocks = cfg.mocks;
     let semantic_types_runtime_types = semantic_types_runtime_types(cfg)?;
     let semantic_types_runtime_types = semantic_types_runtime_types
         .as_ref()
         .unwrap_or(exporter.types);
 
     let mut out = String::new();
+    let mut needs_channel_mapping = false;
 
     if let Some((ndt, name)) = exporter
         .types
@@ -155,12 +154,12 @@ fn runtime(
                 return Err(Error::framework(
                     format!(
                         "Commands '{first}' and '{}' would both export as '{accessor}'. Rename one of them so the generated bindings don't conflict.",
-                        command.name()
+                        command.name.as_ref()
                     ),
                     "",
                 ));
             }
-            seen.insert(accessor, command.name());
+            seen.insert(accessor, command.name.as_ref());
         }
     }
 
@@ -173,32 +172,18 @@ fn runtime(
     let is_channel_used = cfg.commands.iter().any(|command| {
         // Check if any argument is a Channel
         command
-            .args()
+            .args
             .iter()
-            .any(|(_, dt)| is_channel_type(dt, exporter.types))
+            .any(|arg| is_channel_type(&arg.ty, exporter.types))
             // Check if result contains a Channel
-            || command.result().is_some_and(|dt| is_channel_type(dt, exporter.types))
-    });
-    let is_channel_transform_used = cfg.commands.iter().any(|command| {
-        command.args().iter().any(|(_, dt)| {
-            channel_generic_type(dt, exporter.types).is_some_and(|dt| {
-                render_result_transform_for_phase(
-                    dt,
-                    Phase::Deserialize,
-                    "v",
-                    &exporter,
-                    cfg,
-                    semantic_types_runtime_types,
-                )
-                .is_some()
-            })
-        })
+            || command.result.as_ref().is_some_and(|dt| is_channel_type(dt, exporter.types))
     });
     let has_typed_error = enabled_commands
         && cfg.error_handling != ErrorHandlingMode::Throw
         && cfg.commands.iter().any(|command| {
             command
-                .result()
+                .result
+                .as_ref()
                 .and_then(|dt| extract_std_result(dt, exporter.types))
                 .is_some()
         });
@@ -242,9 +227,9 @@ fn runtime(
             }
         }
     }
-    if enabled_events {
-        out.push_str("import * as __TAURI_EVENT from \"@tauri-apps/api/event\";\n");
-    }
+
+    // `tauriEvents` is always emitted, so the event namespace is always imported.
+    out.push_str("import * as __TAURI_EVENT from \"@tauri-apps/api/event\";\n");
     if enabled_mocks {
         out.push_str("import { mockIPC as __TAURI_MOCK_IPC } from \"@tauri-apps/api/mocks\";\n");
     }
@@ -253,37 +238,73 @@ fn runtime(
     if enabled_commands {
         let mut s = Struct::named();
         for command in &cfg.commands {
-            let raw_request = command
-                .args()
+            let named_args = command
+                .args
                 .iter()
-                .any(|(_, dt)| is_ipc_type(dt, exporter.types, "TAURI_REQUEST"));
+                .filter(|arg| !is_ipc_type(&arg.ty, exporter.types, "TAURI_REQUEST"))
+                .collect::<Vec<_>>();
+            let raw_request = named_args.len() != command.args.len();
+            // A payload object cannot carry two independent values under the same key.
+            // Check Tauri's normalized keys, not the generated parameter names.
+            let mut seen_keys = BTreeSet::new();
+            for arg in &named_args {
+                if !seen_keys.insert(arg.name.as_ref()) {
+                    return Err(Error::framework(
+                        format!(
+                            "Command '{}' uses the IPC payload key '{}' more than once. Rename one of the parameters or change `rename_all` so their keys are distinct.",
+                            command.name, arg.name
+                        ),
+                        "",
+                    ));
+                }
+            }
             if raw_request && cfg.mocks {
                 return Err(Error::framework(
-                    command.name().to_string(),
+                    command.name.as_ref().to_string(),
                     "raw IPC request commands are not supported by generated mocks",
                 ));
             }
-            let command_name_escaped =
-                serde_json::to_string(&resolve_tauri_command_name(cfg.plugin_name, command.name()))
-                    .map_err(|err| {
-                        Error::framework("failed to serialize a command name for bindings", err)
-                    })?;
+            let command_name_escaped = serde_json::to_string(&resolve_tauri_command_name(
+                cfg.plugin_name,
+                command.name.as_ref(),
+            ))
+            .map_err(|err| {
+                Error::framework("failed to serialize a command name for bindings", err)
+            })?;
 
-            let mut arguments =
-                command_argument_types(command, &exporter, cfg, semantic_types_runtime_types)?;
-            let named_args = command
-                .args()
-                .iter()
-                .filter(|(_, dt)| !is_ipc_type(dt, exporter.types, "TAURI_REQUEST"))
-                .collect::<Vec<_>>();
+            let result = command
+                .result
+                .as_ref()
+                .and_then(|dt| extract_std_result(dt, exporter.types));
+            let typed_result = result.filter(|_| cfg.error_handling != ErrorHandlingMode::Throw);
+            let mut used_names = BTreeSet::from(["__TAURI_INVOKE".to_string()]);
+            if typed_result.is_some() {
+                used_names.insert("typedError".into());
+            }
+            if cfg.semantic_types.is_some()
+                && command
+                    .args
+                    .iter()
+                    .any(|arg| is_channel_type(&arg.ty, exporter.types))
+            {
+                used_names.insert("mapChannel".into());
+            }
+            let mut arguments = command_arguments(
+                command,
+                &exporter,
+                cfg,
+                semantic_types_runtime_types,
+                &mut used_names,
+            )?;
             let mixed_request = raw_request && !named_args.is_empty();
             if mixed_request {
                 let fields = arguments
                     .iter()
-                    .zip(command.args())
-                    .filter(|(_, (_, dt))| !is_ipc_type(dt, exporter.types, "TAURI_REQUEST"))
-                    .map(|((name, ty), _)| format!("{name}: {ty}"))
-                    .collect::<Vec<_>>()
+                    .zip(&command.args)
+                    .filter(|(_, arg)| !is_ipc_type(&arg.ty, exporter.types, "TAURI_REQUEST"))
+                    // `value` is the IPC payload object, so its keys are Tauri's keys.
+                    .map(|((_, ty), arg)| Ok(format!("{}: {ty}", js_object_key(&arg.name)?)))
+                    .collect::<Result<Vec<_>, Error>>()?
                     .join("; ");
                 arguments = vec![("value".into(), format!("{{ {fields} }}"))];
             } else if raw_request {
@@ -313,37 +334,22 @@ fn runtime(
                 .join(", ");
 
             let arguments_invoke_obj = if mixed_request {
-                let fields = named_args
-                    .iter()
-                    .filter_map(|(name, dt)| {
-                        let name = name.to_lower_camel_case();
-                        let input = format!("value.{name}");
-                        let transform =
-                            if let Some(generic) = channel_generic_type(dt, exporter.types) {
-                                render_result_transform_for_phase(
-                                    generic,
-                                    Phase::Deserialize,
-                                    "v",
-                                    &exporter,
-                                    cfg,
-                                    semantic_types_runtime_types,
-                                )
-                                .map(|transform| jsdoc_transform(transform, "v", jsdoc))
-                                .map(|transform| format!("mapChannel({input}, (v) => {transform})"))
-                            } else {
-                                render_result_transform_for_phase(
-                                    dt,
-                                    Phase::Serialize,
-                                    &input,
-                                    &exporter,
-                                    cfg,
-                                    semantic_types_runtime_types,
-                                )
-                                .map(|transform| jsdoc_transform(transform, &input, jsdoc))
-                            };
-                        transform.map(|transform| format!("{name}: {transform}"))
-                    })
-                    .collect::<Vec<_>>();
+                let mut fields = Vec::new();
+                for arg in named_args {
+                    // Read the original IPC key, not a generated parameter name.
+                    let input = js_member_access("value", &arg.name)?;
+                    if let Some(transform) = invoke_argument(
+                        &input,
+                        &arg.ty,
+                        &exporter,
+                        cfg,
+                        semantic_types_runtime_types,
+                        jsdoc,
+                    ) {
+                        needs_channel_mapping |= is_channel_type(&arg.ty, exporter.types);
+                        fields.push(format!("{}: {transform}", js_object_key(&arg.name)?));
+                    }
+                }
                 let value = if fields.is_empty() {
                     "value".to_string()
                 } else {
@@ -353,54 +359,45 @@ fn runtime(
             } else if raw_request {
                 let name = &arguments[0].0;
                 format!(", Array.isArray({name}) ? new Uint8Array({name}) : {name}, {options_name}")
-            } else if command.args().is_empty() {
+            } else if command.args.is_empty() {
                 format!(", undefined, {options_name}")
             } else {
                 format!(
                     ", {{ {} }}, {options_name}",
                     command
-                        .args()
+                        .args
                         .iter()
-                        .map(|(name, dt)| {
-                            let name = name.to_lower_camel_case();
-                            let value = if let Some(generic) =
-                                channel_generic_type(dt, exporter.types)
-                            {
-                                render_result_transform_for_phase(
-                                    generic,
-                                    Phase::Deserialize,
-                                    "v",
-                                    &exporter,
-                                    cfg,
-                                    semantic_types_runtime_types,
-                                )
-                                .map(|transform| jsdoc_transform(transform, "v", jsdoc))
-                                .map(|transform| format!("mapChannel({name}, (v) => {transform})"))
-                            } else {
-                                render_result_transform_for_phase(
-                                    dt,
-                                    Phase::Serialize,
-                                    &name,
-                                    &exporter,
-                                    cfg,
-                                    semantic_types_runtime_types,
-                                )
-                                .map(|transform| jsdoc_transform(transform, &name, jsdoc))
-                            };
+                        .zip(&arguments)
+                        .map(|(arg, (param, _))| {
+                            let key = arg.name.as_ref();
+                            let value = invoke_argument(
+                                param,
+                                &arg.ty,
+                                &exporter,
+                                cfg,
+                                semantic_types_runtime_types,
+                                jsdoc,
+                            );
+                            needs_channel_mapping |=
+                                value.is_some() && is_channel_type(&arg.ty, exporter.types);
 
-                            value.map_or(name.clone(), |value| format!("{name}: {value}"))
+                            Ok(match value {
+                                None if key == param => param.clone(),
+                                value => format!(
+                                    "{}: {}",
+                                    js_object_key(key)?,
+                                    value.as_deref().unwrap_or(param)
+                                ),
+                            })
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Result<Vec<_>, Error>>()?
                         .join(", ")
                 )
             };
 
             let invoke_args = format!("({command_name_escaped}{arguments_invoke_obj})",);
 
-            let body = if cfg.error_handling != ErrorHandlingMode::Throw
-                && let Some(result) = command.result()
-                && let Some((dt_ok, dt_err)) = extract_std_result(result, exporter.types)
-            {
+            let body = if let Some((dt_ok, dt_err)) = typed_result {
                 let semantic_err_type = apply_semantic_type_for_phase(
                     dt_err,
                     Phase::Deserialize,
@@ -416,7 +413,7 @@ fn runtime(
                         }))
                 {
                     return Err(Error::framework(
-                        command.name().to_string(),
+                        command.name.as_ref().to_string(),
                         "DataError mode requires a non-nullable command error type because null marks a successful result",
                     ));
                 }
@@ -446,29 +443,29 @@ fn runtime(
                     semantic_types_runtime_types,
                 )
                 .map(|transform| jsdoc_transform(transform, "v.data", jsdoc));
-                // `ResultUnknown` declares the error as `unknown`, so the transform must
-                // accept whatever the rejection was. Widen the input so a transform written
-                // against the command's error type still type-checks; the runtime value is
-                // unchanged.
-                let err_input = if cfg.error_handling == ErrorHandlingMode::ResultUnknown {
-                    "(v.error as any)"
-                } else {
-                    "v.error"
+                // An invoke rejection can also be a framework error. In ResultUnknown
+                // pass it through as-is rather than assuming the command's error type.
+                let err_transform = match cfg.error_handling {
+                    ErrorHandlingMode::ResultUnknown => None,
+                    _ => render_result_transform_for_phase(
+                        dt_err,
+                        Phase::Deserialize,
+                        "v.error",
+                        &exporter,
+                        cfg,
+                        semantic_types_runtime_types,
+                    )
+                    .map(|transform| jsdoc_transform(transform, "v.error", jsdoc)),
                 };
-                let err_transform = render_result_transform_for_phase(
-                    dt_err,
-                    Phase::Deserialize,
-                    err_input,
-                    &exporter,
-                    cfg,
-                    semantic_types_runtime_types,
-                )
-                .map(|transform| jsdoc_transform(transform, err_input, jsdoc));
 
                 let mut invoke_ts = "typedError".to_string();
-                if !jsdoc {
-                    invoke_ts.push('<');
-                    invoke_ts.push_str(&render_reference_dt_for_phase(
+                // DataError uses null in both arms, which can leak into both
+                // type arguments through contextual inference in JavaScript.
+                let specialize_jsdoc = jsdoc
+                    && cfg.error_handling == ErrorHandlingMode::DataError
+                    && cfg.typed_error_impl.is_empty();
+                if !jsdoc || specialize_jsdoc {
+                    let ok = render_reference_dt_for_phase(
                         dt_ok,
                         if ok_semantic_type {
                             Phase::Deserialize
@@ -479,9 +476,8 @@ fn runtime(
                         &exporter,
                         cfg,
                         semantic_types_runtime_types,
-                    )?);
-                    invoke_ts.push_str(", ");
-                    invoke_ts.push_str(&render_reference_dt_for_phase(
+                    )?;
+                    let err = render_reference_dt_for_phase(
                         dt_err,
                         if err_semantic_type {
                             Phase::Deserialize
@@ -492,8 +488,12 @@ fn runtime(
                         &exporter,
                         cfg,
                         semantic_types_runtime_types,
-                    )?);
-                    invoke_ts.push('>');
+                    )?;
+                    invoke_ts = if specialize_jsdoc {
+                        format!("/** @type {{typeof typedError<{ok}, {err}>}} */ (typedError)")
+                    } else {
+                        format!("typedError<{ok}, {err}>")
+                    };
                 }
                 invoke_ts.push_str("(__TAURI_INVOKE");
                 invoke_ts.push_str(&invoke_args);
@@ -512,10 +512,7 @@ fn runtime(
                 }
             } else {
                 let mut invoke_ts = "__TAURI_INVOKE".to_string();
-                let output_dt = command
-                    .result()
-                    .and_then(|dt| extract_std_result(dt, exporter.types).map(|(ok, _)| ok))
-                    .or(command.result());
+                let output_dt = result.map(|(ok, _)| ok).or(command.result.as_ref());
 
                 if !jsdoc {
                     let output_semantic_type = output_dt.is_some_and(|dt| {
@@ -529,11 +526,9 @@ fn runtime(
                         )
                     });
                     invoke_ts.push('<');
-                    invoke_ts.push_str(&match command.result() {
+                    invoke_ts.push_str(&match output_dt {
                         Some(dt) => Cow::Owned(render_reference_dt_for_phase(
-                            extract_std_result(dt, exporter.types)
-                                .map(|(ok, _)| ok)
-                                .unwrap_or(dt),
+                            dt,
                             if output_semantic_type {
                                 Phase::Deserialize
                             } else {
@@ -599,10 +594,7 @@ fn runtime(
                         docs.push('\n');
                     }
 
-                    let returns = if cfg.error_handling != ErrorHandlingMode::Throw
-                        && let Some(result) = command.result()
-                        && let Some((dt_ok, dt_err)) = extract_std_result(result, exporter.types)
-                    {
+                    let returns = if let Some((dt_ok, dt_err)) = typed_result {
                         let ok_semantic_type = has_semantic_type_for_phase(
                             dt_ok,
                             Phase::Deserialize,
@@ -646,10 +638,7 @@ fn runtime(
 
                         result_type(cfg.error_handling, &ok, &err)
                     } else {
-                        let output_dt = command
-                            .result()
-                            .and_then(|dt| extract_std_result(dt, exporter.types).map(|(ok, _)| ok))
-                            .or(command.result());
+                        let output_dt = result.map(|(ok, _)| ok).or(command.result.as_ref());
                         let output_semantic_type = output_dt.is_some_and(|dt| {
                             has_semantic_type_for_phase(
                                 dt,
@@ -698,35 +687,47 @@ fn runtime(
     }
 
     // Events
-    if enabled_events {
+    if has_user_events {
         let mut s = Struct::named();
+        let mut accessors = BTreeMap::new();
         for (name, (_, r)) in &cfg.events {
+            let accessor = cfg.function_casing.apply(name);
+            if let Some(first) = accessors.insert(accessor.clone(), name) {
+                return Err(Error::framework(
+                    format!(
+                        "Events '{first}' and '{name}' would both export as '{accessor}'. Rename one of them so the generated bindings don't conflict."
+                    ),
+                    "",
+                ));
+            }
             let event_name_escaped =
                 serde_json::to_string(&resolve_tauri_event_name(cfg.plugin_name, name)).map_err(
                     |err| Error::framework("failed to serialize an event name for bindings", err),
                 )?;
 
             let event_dt = DataType::Reference(r.clone());
+            let listen_ty = render_reference_dt_for_phase(
+                &event_dt,
+                Phase::Serialize,
+                Phase::Deserialize,
+                &exporter,
+                cfg,
+                semantic_types_runtime_types,
+            )?;
+            let emit_ty = render_reference_dt_for_phase(
+                &event_dt,
+                Phase::Deserialize,
+                Phase::Serialize,
+                &exporter,
+                cfg,
+                semantic_types_runtime_types,
+            )?;
             let mut field_ts = "makeEvent".to_string();
             if !jsdoc {
                 field_ts.push('<');
-                field_ts.push_str(&render_reference_dt_for_phase(
-                    &event_dt,
-                    Phase::Serialize,
-                    Phase::Deserialize,
-                    &exporter,
-                    cfg,
-                    semantic_types_runtime_types,
-                )?);
+                field_ts.push_str(&listen_ty);
                 field_ts.push_str(", ");
-                field_ts.push_str(&render_reference_dt_for_phase(
-                    &event_dt,
-                    Phase::Deserialize,
-                    Phase::Serialize,
-                    &exporter,
-                    cfg,
-                    semantic_types_runtime_types,
-                )?);
+                field_ts.push_str(&emit_ty);
                 field_ts.push('>');
             }
             field_ts.push('(');
@@ -768,20 +769,14 @@ fn runtime(
 
             let mut field = Field::new(define(field_ts).into());
             if jsdoc {
-                field.docs = format!(
-                    "@type {{ReturnType<typeof makeEvent<{}>>}}",
-                    render_reference_dt_for_phase(
-                        &DataType::Reference(r.clone()),
-                        Phase::Deserialize,
-                        Phase::Deserialize,
-                        &exporter,
-                        cfg,
-                        semantic_types_runtime_types,
-                    )?
-                )
-                .into();
+                let type_args = if listen_ty == emit_ty {
+                    listen_ty
+                } else {
+                    format!("{listen_ty}, {emit_ty}")
+                };
+                field.docs = format!("@type {{ReturnType<typeof makeEvent<{type_args}>>}}").into();
             }
-            s = s.field(cfg.function_casing.apply(name).into_owned(), field);
+            s = s.field(accessor.into_owned(), field);
         }
 
         out.push_str("\n/** Events */");
@@ -789,6 +784,38 @@ fn runtime(
         out.push_str(&exporter.reference(&s.build())?);
         out.push_str(";\n");
     }
+
+    // Built-in events. These are always emitted: Tauri sends them whether or not
+    // the user registered any of their own.
+    let mut s = Struct::named();
+    for event in BUILTIN_EVENTS {
+        // A unit payload is `null` in both emitters, which is the same shape a user's
+        // `null` event payload gets. In TypeScript, `EventEmit` then types `emit` as
+        // taking no argument.
+        let payload = event.payload.unwrap_or("null");
+        let accessor = if jsdoc {
+            format!("makeEvent(\"{}\")", event.name)
+        } else {
+            format!("makeEvent<{payload}>(\"{}\")", event.name)
+        };
+
+        let mut field = Field::new(define(accessor).into());
+        field.docs = if jsdoc {
+            format!(
+                "{}\n@type {{ReturnType<typeof makeEvent<{payload}>>}}",
+                event.docs
+            )
+            .into()
+        } else {
+            event.docs.into()
+        };
+        s = s.field(event.accessor, field);
+    }
+
+    out.push_str("\n/** Built-in Tauri events */");
+    out.push_str("\nexport const tauriEvents = ");
+    out.push_str(&exporter.reference(&s.build())?);
+    out.push_str(";\n");
 
     // Constants
     if !cfg.constants.is_empty() {
@@ -833,35 +860,32 @@ fn runtime(
     }
 
     // Runtime
-    if has_typed_error || enabled_events || is_channel_transform_used {
-        out.push_str("\n/* Tauri Specta runtime */\n");
+    // `tauriEvents` always needs `makeEvent`, so this block is always emitted.
+    out.push_str("\n/* Tauri Specta runtime */\n");
 
-        if is_channel_transform_used {
-            out.push_str(map_channel_impl);
-            out.push('\n');
-            if has_typed_error || enabled_events {
-                out.push('\n');
-            }
-        }
-        if has_typed_error {
-            out.push_str(typed_error_impl);
-            out.push('\n');
-            // We check against `cfg` not `typed_error_assertion` as we only include the assertion if the user-provides an impl.
-            // It's assumed the internal one is correct.
-            if !cfg.typed_error_impl.is_empty() {
-                out.push('\n');
-                out.push_str(typed_error_assertion);
-                out.push('\n');
-            }
-            if enabled_events {
-                out.push('\n');
-            }
-        }
-        if enabled_events {
-            out.push_str(make_event_impl);
-            out.push('\n');
-        }
+    if needs_channel_mapping {
+        out.push_str(if jsdoc {
+            MAP_CHANNEL_IMPL_JS
+        } else {
+            MAP_CHANNEL_IMPL_TS
+        });
+        out.push('\n');
     }
+
+    if has_typed_error {
+        out.push_str(typed_error_impl);
+        out.push('\n');
+        // We check against `cfg` not `typed_error_assertion` as we only include the assertion if the user-provides an impl.
+        // It's assumed the internal one is correct.
+        if !cfg.typed_error_impl.is_empty() {
+            out.push('\n');
+            out.push_str(typed_error_assertion);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(make_event_impl);
+    out.push('\n');
 
     // Mocks
     if enabled_mocks {
@@ -898,7 +922,130 @@ fn runtime(
     Ok(Cow::Owned(out))
 }
 
-/// A command accessor as it should appear as an object key.
+/// One of Tauri's own events, as it is serialized by the Tauri runtime.
+struct BuiltinEvent {
+    /// The accessor name under `tauriEvents`, matching the event's `TauriEvent` variant.
+    accessor: &'static str,
+    /// The Tauri event name.
+    name: &'static str,
+    /// The TypeScript payload type. `None` for a unit payload, which Tauri sends as `null`.
+    payload: Option<&'static str>,
+    /// One-line description of the event for the generated docs.
+    docs: &'static str,
+}
+
+/// Tauri's built-in events, with the payload each emitter serializes.
+///
+/// Verified against tauri 2.12.5: window and drag-and-drop events in
+/// `src/manager/window.rs` (`on_window_event`), `tauri://window-created` in
+/// `src/window/mod.rs` (`WindowBuilder::build_internal`), `tauri://webview-created` in
+/// `src/manager/webview.rs` (`prepare_webview`), and `Theme`'s bare-string
+/// serialization in `tauri-utils`' `src/lib.rs`.
+///
+/// Keep this in step with `TauriEvent` in `@tauri-apps/api/event`; the accessor names here
+/// are that enum's variants in camel case.
+const BUILTIN_EVENTS: &[BuiltinEvent] = &[
+    BuiltinEvent {
+        accessor: "windowResized",
+        name: "tauri://resize",
+        payload: Some("{ width: number; height: number }"),
+        docs: "A window was resized. Payload: the new inner size, in physical pixels.",
+    },
+    BuiltinEvent {
+        accessor: "windowMoved",
+        name: "tauri://move",
+        payload: Some("{ x: number; y: number }"),
+        docs: "A window moved. Payload: the new outer position, in physical pixels.",
+    },
+    BuiltinEvent {
+        accessor: "windowCloseRequested",
+        name: "tauri://close-requested",
+        payload: None,
+        docs: "The user requested that a window close.",
+    },
+    BuiltinEvent {
+        accessor: "windowDestroyed",
+        name: "tauri://destroyed",
+        payload: None,
+        docs: "A window was destroyed.",
+    },
+    BuiltinEvent {
+        accessor: "windowFocus",
+        name: "tauri://focus",
+        payload: None,
+        docs: "A window gained focus.",
+    },
+    BuiltinEvent {
+        accessor: "windowBlur",
+        name: "tauri://blur",
+        payload: None,
+        docs: "A window lost focus.",
+    },
+    BuiltinEvent {
+        accessor: "windowScaleFactorChanged",
+        name: "tauri://scale-change",
+        payload: Some("{ scaleFactor: number; size: { width: number; height: number } }"),
+        docs: "The scale factor of the monitor a window is on changed. Payload: the new scale factor and inner size, in physical pixels.",
+    },
+    BuiltinEvent {
+        accessor: "windowThemeChanged",
+        name: "tauri://theme-changed",
+        // `Theme` serializes through `Display` to a bare string, not an object.
+        payload: Some("\"light\" | \"dark\""),
+        docs: "The system or window theme changed.",
+    },
+    BuiltinEvent {
+        accessor: "windowCreated",
+        name: "tauri://window-created",
+        payload: Some("{ label: string }"),
+        docs: "A window was created.",
+    },
+    BuiltinEvent {
+        accessor: "windowSuspended",
+        name: "tauri://suspended",
+        payload: None,
+        docs: "A window's event loop was suspended. Mobile only.",
+    },
+    BuiltinEvent {
+        accessor: "windowResumed",
+        name: "tauri://resumed",
+        payload: None,
+        docs: "A window's event loop was resumed. Mobile only.",
+    },
+    BuiltinEvent {
+        accessor: "webviewCreated",
+        name: "tauri://webview-created",
+        payload: Some("{ label: string }"),
+        docs: "A webview was created.",
+    },
+    BuiltinEvent {
+        accessor: "dragEnter",
+        name: "tauri://drag-enter",
+        payload: Some("{ paths: string[]; position: { x: number; y: number } }"),
+        docs: "The user dragged files onto a window. Payload: the dragged paths and the pointer position.",
+    },
+    BuiltinEvent {
+        accessor: "dragOver",
+        name: "tauri://drag-over",
+        // Tauri skips serializing `paths` when the payload comes from an `Over` event.
+        payload: Some("{ position: { x: number; y: number } }"),
+        docs: "The user is moving dragged files over a window. Payload: the pointer position.",
+    },
+    BuiltinEvent {
+        accessor: "dragDrop",
+        name: "tauri://drag-drop",
+        payload: Some("{ paths: string[]; position: { x: number; y: number } }"),
+        docs: "The user dropped files onto a window. Payload: the dropped paths and the pointer position.",
+    },
+    BuiltinEvent {
+        accessor: "dragLeave",
+        name: "tauri://drag-leave",
+        payload: None,
+        docs: "The drag operation left a window or was cancelled.",
+    },
+];
+
+/// An accessor or IPC payload key as it should appear in an object literal or type.
 ///
 /// Accessors are usually plain identifiers, but [`Casing::KebabCase`](crate::Casing)
 /// produces keys like `hello-world`, which have to be quoted. This is the same rule
@@ -908,7 +1055,7 @@ fn js_object_key(accessor: &str) -> Result<String, Error> {
         Ok(accessor.to_string())
     } else {
         serde_json::to_string(accessor)
-            .map_err(|err| Error::framework("failed to serialize a command accessor", err))
+            .map_err(|err| Error::framework("failed to serialize a JavaScript property key", err))
     }
 }
 
@@ -917,11 +1064,7 @@ fn js_member_access(object: &str, accessor: &str) -> Result<String, Error> {
     if is_js_identifier(accessor) {
         Ok(format!("{object}.{accessor}"))
     } else {
-        Ok(format!(
-            "{object}[{}]",
-            serde_json::to_string(accessor)
-                .map_err(|err| Error::framework("failed to serialize a command accessor", err))?
-        ))
+        Ok(format!("{object}[{}]", js_object_key(accessor)?))
     }
 }
 
@@ -985,25 +1128,23 @@ fn mock_handlers_declaration(
     Ok(out)
 }
 
-/// The frontend-facing name and type of each of a command's arguments.
-///
-/// This is what the generated `commands` accessor declares and what its IPC payload uses,
-/// so anything else describing the same command — mock handlers, for instance — is
-/// written in exactly these terms.
-fn command_argument_types(
-    command: &Function,
+/// The generated parameter name and type for each argument, in declaration order.
+/// Payload keys are kept separately in `CommandArg::name`.
+fn command_arguments(
+    command: &crate::Command,
     exporter: &FrameworkExporter,
     cfg: &BuilderConfiguration,
     semantic_types_runtime_types: &Types,
+    used_names: &mut BTreeSet<String>,
 ) -> Result<Vec<(String, String)>, Error> {
     command
-        .args()
+        .args
         .iter()
-        .map(|(name, dt)| {
+        .map(|arg| {
             Ok((
-                name.to_lower_camel_case(),
+                command_parameter_name(&arg.name, used_names),
                 render_reference_dt_for_phase(
-                    dt,
+                    &arg.ty,
                     Phase::Deserialize,
                     Phase::Serialize,
                     exporter,
@@ -1015,19 +1156,107 @@ fn command_argument_types(
         .collect()
 }
 
+fn command_parameter_name(key: &str, used_names: &mut BTreeSet<String>) -> String {
+    let mut name = key.to_lower_camel_case();
+    if !is_js_identifier(&name) {
+        name.insert(0, '_');
+        if !is_js_identifier(&name) {
+            // Be conservative for non-ASCII names; the original key remains in the payload.
+            name = "_arg".into();
+        }
+    }
+    while is_reserved_parameter_name(&name) || !used_names.insert(name.clone()) {
+        name.insert(0, '_');
+    }
+    name
+}
+
+fn is_reserved_parameter_name(name: &str) -> bool {
+    // The generated bindings are modules: strict-mode restrictions apply to parameters.
+    matches!(
+        name,
+        "arguments"
+            | "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "eval"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "implements"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "interface"
+            | "let"
+            | "new"
+            | "null"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "static"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
 /// The `(arguments, result)` signature of one command's mock handler.
 ///
 /// This mirrors how `commands` types the same command, so a handler is written in the
 /// same terms as the call it stands in for, rather than in terms of the IPC payload.
 fn mock_handler_signature(
-    command: &Function,
+    command: &crate::Command,
     exporter: &FrameworkExporter,
     cfg: &BuilderConfiguration,
     semantic_types_runtime_types: &Types,
 ) -> Result<(String, String), Error> {
     validate_mock_transforms(command, exporter, cfg, semantic_types_runtime_types)?;
 
-    let arguments = command_argument_types(command, exporter, cfg, semantic_types_runtime_types)?;
+    // A handler is called with the invoke payload, so its keys are the payload keys
+    // rather than the camelCased names the generated accessor uses.
+    let arguments = command
+        .args
+        .iter()
+        .map(|arg| {
+            Ok((
+                arg.name.to_string(),
+                render_reference_dt_for_phase(
+                    &arg.ty,
+                    Phase::Deserialize,
+                    Phase::Serialize,
+                    exporter,
+                    cfg,
+                    semantic_types_runtime_types,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
 
     let arguments = if arguments.is_empty() {
         "()".to_string()
@@ -1036,8 +1265,8 @@ fn mock_handler_signature(
             "(args: {{ {} }})",
             arguments
                 .iter()
-                .map(|(name, dt)| format!("{name}: {dt}"))
-                .collect::<Vec<_>>()
+                .map(|(name, dt)| Ok(format!("{}: {dt}", js_object_key(name)?)))
+                .collect::<Result<Vec<_>, Error>>()?
                 .join("; ")
         )
     };
@@ -1045,9 +1274,10 @@ fn mock_handler_signature(
     // A handler returns the command's success value: for a `Result`, that is the `Ok`
     // side, since a mock fails a command by throwing rather than by returning `Err`.
     let result = match command
-        .result()
+        .result
+        .as_ref()
         .and_then(|dt| extract_std_result(dt, exporter.types).map(|(ok, _)| ok))
-        .or(command.result())
+        .or(command.result.as_ref())
     {
         Some(dt) => {
             let result_semantic_type = has_semantic_type_for_phase(
@@ -1086,7 +1316,7 @@ fn mock_handler_signature(
 /// lie, and the transform's output type can't be recovered from the rule. Fail the export
 /// rather than emit a binding that lies, like the other export-time validations do.
 fn validate_mock_transforms(
-    command: &Function,
+    command: &crate::Command,
     exporter: &FrameworkExporter,
     cfg: &BuilderConfiguration,
     semantic_types_runtime_types: &Types,
@@ -1105,7 +1335,7 @@ fn validate_mock_transforms(
             return Err(Error::framework(
                 format!(
                     "`Builder::mocks` can't type a mock for command '{}': {subject} is reshaped by a semantic type transform, so the handler wouldn't receive or return the type it declares. Export the mocks without `Builder::semantic_types`, or drop `Builder::mocks`.",
-                    command.name()
+                    command.name.as_ref()
                 ),
                 "",
             ));
@@ -1114,26 +1344,32 @@ fn validate_mock_transforms(
         Ok(())
     };
 
-    for (name, dt) in command.args() {
+    for arg in &command.args {
         // A channel's payload is transformed as messages arrive, so either way the handler
         // sees the `Channel<T>` it declares.
-        if channel_generic_type(dt, exporter.types).is_some() {
+        if channel_generic_type(&arg.ty, exporter.types).is_some() {
             continue;
         }
 
-        reject(dt, Phase::Serialize, &format!("argument '{name}'"))?;
+        reject(
+            &arg.ty,
+            Phase::Serialize,
+            &format!("argument '{}'", arg.name),
+        )?;
     }
 
-    if let Some(result) = command.result() {
+    if let Some(result) = command.result.as_ref() {
         let (ok, err) = extract_std_result(result, exporter.types)
             .map_or((result, None), |(ok, err)| (ok, Some(err)));
 
         reject(ok, Phase::Deserialize, "the result")?;
 
-        // A `Throw` mode failure is passed through as-is, so only a mode that wraps the
-        // error goes through a transform.
+        // Only modes that assume the rejection has the declared error type transform it.
         if let Some(err) = err
-            && cfg.error_handling != ErrorHandlingMode::Throw
+            && matches!(
+                cfg.error_handling,
+                ErrorHandlingMode::Result | ErrorHandlingMode::DataError
+            )
         {
             reject(err, Phase::Deserialize, "the error")?;
         }
@@ -1146,9 +1382,16 @@ fn validate_mock_transforms(
 /// handler.
 fn mock_commands_impl(cfg: &BuilderConfiguration, jsdoc: bool) -> Result<String, Error> {
     let mut out = String::new();
+    out.push_str(if jsdoc {
+        MOCK_CALL_TYPES_JS
+    } else {
+        MOCK_CALL_TYPES_TS
+    });
+    out.push('\n');
     out.push_str(MOCK_COMMANDS_DOC);
     if jsdoc {
         out.push_str("\n *\n * @param {Partial<MockCommandHandlers>} [handlers]");
+        out.push_str("\n * @returns {MockCommandsHandle}");
     }
     out.push_str("\n */\n");
 
@@ -1156,7 +1399,7 @@ fn mock_commands_impl(cfg: &BuilderConfiguration, jsdoc: bool) -> Result<String,
         out.push_str("export function mockCommands(handlers = {}) {\n");
     } else {
         out.push_str(
-            "export function mockCommands(handlers: Partial<MockCommandHandlers> = {}): void {\n",
+            "export function mockCommands(handlers: Partial<MockCommandHandlers> = {}): MockCommandsHandle {\n",
         );
     }
     out.push_str(if jsdoc {
@@ -1164,17 +1407,12 @@ fn mock_commands_impl(cfg: &BuilderConfiguration, jsdoc: bool) -> Result<String,
     } else {
         MOCK_HANDLER_REGISTRY_IMPL_TS
     });
-
-    // An events-only builder never reads `args`, which `noUnusedParameters` (set by every
-    // tsconfig in this repo's examples) would reject.
-    let callback_args = if cfg.commands.is_empty() {
-        "_args"
+    out.push_str(if jsdoc {
+        "    /** @type {MockCall[]} */\n    const calls = [];\n"
     } else {
-        "args"
-    };
-    out.push_str(&format!(
-        "    return __TAURI_MOCK_IPC((cmd, {callback_args}) => {{\n"
-    ));
+        "    const calls: MockCall[] = [];\n"
+    });
+    out.push_str("    __TAURI_MOCK_IPC((cmd, args) => {\n");
     out.push_str("        switch (cmd) {\n");
 
     for command in cfg.commands.iter() {
@@ -1183,21 +1421,35 @@ fn mock_commands_impl(cfg: &BuilderConfiguration, jsdoc: bool) -> Result<String,
             .apply(cfg.command_accessor_name(command))
             .into_owned();
         let access = js_member_access("mockHandlers", &accessor)?;
-        let command_name =
-            serde_json::to_string(&resolve_tauri_command_name(cfg.plugin_name, command.name()))
-                .map_err(|err| {
-                    Error::framework("failed to serialize a command name for bindings", err)
-                })?;
+        // The recorded name is the accessor, not the Tauri command name, so a test can
+        // assert against the same name it uses for `commands`.
+        let accessor_literal = serde_json::to_string(&accessor)
+            .map_err(|err| Error::framework("failed to serialize a command accessor", err))?;
+        let command_name = serde_json::to_string(&resolve_tauri_command_name(
+            cfg.plugin_name,
+            command.name.as_ref(),
+        ))
+        .map_err(|err| Error::framework("failed to serialize a command name for bindings", err))?;
         out.push_str(&format!(
-            "            case {command_name}: return mockCommandHandler({access}, {command_name}, args);\n"
+            "            case {command_name}: calls.push({{ command: {accessor_literal}, args }}); return mockCommandHandler({access}, {command_name}, args);\n"
         ));
     }
 
+    // Record before dispatching, so a call that fails is still part of the history. A
+    // command the bindings don't generate has no accessor to record, so it keeps the raw
+    // Tauri command name the frontend passed to `invoke`.
+    out.push_str("            default:\n");
+    out.push_str("                calls.push({ command: cmd, args });\n");
     out.push_str(
-        "            default: throw new Error(`No mock handler registered for command '${cmd}'`);\n",
+        "                throw new Error(`No mock handler registered for command '${cmd}'`);\n",
     );
     out.push_str("        }\n");
     out.push_str("    }, { shouldMockEvents: true });\n");
+    // Frozen so `handle.calls = []` can't silently orphan the array the installed
+    // callback keeps appending to. The array itself stays mutable: it is the history.
+    out.push_str(
+        "    return Object.freeze({\n        calls,\n        clear: () => {\n            calls.length = 0;\n        },\n    });\n",
+    );
     out.push_str("}\n");
 
     Ok(out)
@@ -1313,10 +1565,10 @@ fn extract_std_result<'a>(
 fn hide_unused_std_result_type(cfg: &BuilderConfiguration, mut types: Types) -> Types {
     let is_std_result_used_after_command_result_flattening = cfg.commands.iter().any(|command| {
         command
-            .args()
+            .args
             .iter()
-            .any(|(_, dt)| datatype_contains_std_result(dt, &types))
-            || command.result().is_some_and(|dt| {
+            .any(|arg| datatype_contains_std_result(&arg.ty, &types))
+            || command.result.as_ref().is_some_and(|dt| {
                 if let Some((ok, err)) = extract_std_result(dt, &types) {
                     datatype_contains_std_result(ok, &types)
                         || datatype_contains_std_result(err, &types)
@@ -1632,18 +1884,22 @@ fn validate_channel_placement(cfg: &BuilderConfiguration, types: &Types) -> Resu
     }
 
     for command in cfg.commands.iter() {
-        for (name, dt) in command.args() {
+        for arg in &command.args {
             validate_channel_signature_datatype(
-                dt,
+                &arg.ty,
                 types,
-                &format!("argument '{name}' of command '{}'", command.name()),
+                &format!(
+                    "argument '{}' of command '{}'",
+                    arg.name,
+                    command.name.as_ref()
+                ),
             )?;
         }
-        if let Some(dt) = command.result() {
+        if let Some(dt) = command.result.as_ref() {
             validate_channel_signature_datatype(
                 dt,
                 types,
-                &format!("the result of command '{}'", command.name()),
+                &format!("the result of command '{}'", command.name.as_ref()),
             )?;
         }
     }
@@ -1699,6 +1955,44 @@ fn channel_nested_error(site: ChannelSite<'_>, signature_subject: &str) -> Error
     )
 }
 
+/// The JavaScript expression that adapts one command argument for the IPC.
+///
+/// A `Channel` payload is decoded as messages arrive, so the transform is
+/// registered on the channel itself: `mapChannel` keeps the channel the caller
+/// passed (and the callback id Rust addresses) intact on released APIs too. Every other
+/// argument is transformed before it is sent.
+fn invoke_argument(
+    input: &str,
+    dt: &DataType,
+    exporter: &FrameworkExporter,
+    cfg: &BuilderConfiguration,
+    semantic_types_runtime_types: &Types,
+    jsdoc: bool,
+) -> Option<String> {
+    if let Some(payload) = channel_generic_type(dt, exporter.types) {
+        render_result_transform_for_phase(
+            payload,
+            Phase::Deserialize,
+            "v",
+            exporter,
+            cfg,
+            semantic_types_runtime_types,
+        )
+        .map(|transform| jsdoc_transform(transform, "v", jsdoc))
+        .map(|transform| format!("mapChannel({input}, (v) => {transform})"))
+    } else {
+        render_result_transform_for_phase(
+            dt,
+            Phase::Serialize,
+            input,
+            exporter,
+            cfg,
+            semantic_types_runtime_types,
+        )
+        .map(|transform| jsdoc_transform(transform, input, jsdoc))
+    }
+}
+
 fn render_result_transform_for_phase(
     dt: &DataType,
     phase: Phase,
@@ -1707,15 +2001,9 @@ fn render_result_transform_for_phase(
     cfg: &BuilderConfiguration,
     semantic_types_runtime_types: &Types,
 ) -> Option<String> {
+    // Keep named references so Specta can match registered semantic rules before
+    // descending into the type's fields.
     let dt = specta_serde::select_phase_datatype(dt, semantic_types_runtime_types, phase);
-    let dt = if let DataType::Reference(Reference::Named(r)) = &dt
-        && let Some(ndt) = semantic_types_runtime_types.get(r)
-        && let Some(dt) = &ndt.ty
-    {
-        dt.clone()
-    } else {
-        dt
-    };
     apply_semantic_type_for_phase(&dt, phase, input, semantic_types_runtime_types, cfg)
         .map(|(_, mapped)| mapped)
         .filter(|mapped| mapped != input)
@@ -1869,16 +2157,20 @@ const RESERVED_NDT_NAMES: &[&str] = &[
     "Channel",
     "__TAURI_EVENT",
     "__TAURI_INVOKE",
+    "tauriEvents",
     "typedError",
     "makeEvent",
     "mapChannel",
+    "channelTransform",
 ];
 
 /// Names only the mocks runtime declares, and so only reserved on an export that
 /// [`Builder::mocks`](crate::Builder::mocks) actually emits them for.
 const RESERVED_NDT_NAMES_MOCKS_ONLY: &[&str] = &[
     "__TAURI_MOCK_IPC",
+    "MockCall",
     "MockCommandHandlers",
+    "MockCommandsHandle",
     "mockCommandHandler",
     "mockCommands",
 ];
@@ -1923,20 +2215,6 @@ const DATA_ERROR_IMPL_TS: &str = r#"async function typedError<T, E>(result: Prom
     }
 }"#;
 
-const MAP_CHANNEL_IMPL_TS: &str = r#"function mapChannel<T>(channel: Channel<T>, deserialize: (payload: any) => T): Channel<T> {
-    return new Channel((payload) => channel.onmessage(deserialize(payload)));
-}"#;
-
-const MAP_CHANNEL_IMPL_JS: &str = r#"/**
- * @template T
- * @param {Channel<T>} channel
- * @param {(payload: any) => T} deserialize
- * @returns {Channel<T>}
- */
-function mapChannel(channel, deserialize) {
-    return new Channel((payload) => channel.onmessage(deserialize(payload)));
-}"#;
-
 const TYPED_ERROR_IMPL_JS: &str = r#"/**
   * @template T
   * @template E
@@ -1948,7 +2226,7 @@ async function typedError(result) {
         return { status: "ok", data: await result };
     } catch (e) {
         if (e instanceof Error) throw e;
-        return { status: "error", error: e };
+        return { status: "error", error: /** @type {E} */ (e) };
     }
 }"#;
 
@@ -1977,27 +2255,161 @@ async function typedError(result) {
         return { data: await result, error: null };
     } catch (e) {
         if (e instanceof Error) throw e;
-        return { data: null, error: e };
+        return { data: null, error: /** @type {E} */ (e) };
     }
 }"#;
 
 const TYPED_ERROR_ASSERTION_TS: &str = "const _assertTypedErrorFollowsContract: <T, E>(result: Promise<T>) => Promise<any> = typedError;";
 
+const MOCK_CALL_TYPES_TS: &str = r#"/**
+ * One command invocation observed by a set of mock handlers.
+ *
+ * `command` is the `commands` accessor that was called, e.g. `greet`. A command the
+ * bindings do not generate has no accessor to record, so it keeps the raw Tauri command
+ * name the frontend passed to `invoke` — which is not cased like an accessor. That is why
+ * it is `string` rather than a union of accessor names: such a union would be a lie for
+ * those calls.
+ */
+export type MockCall = {
+    /**
+     * The generated command accessor, e.g. `greet`, or, for a command the bindings don't
+     * generate, its raw Tauri command name.
+     */
+    readonly command: string;
+    /**
+     * The arguments `invoke` received, not a copy, so it is `unknown`: the generated
+     * `commands` accessor passes `{}` for a command with no arguments, and a raw `invoke`
+     * can also pass Tauri's array and buffer payload shapes.
+     */
+    readonly args: unknown;
+};
+
+/** The handle `mockCommands` returns for the handlers it installed. */
+export type MockCommandsHandle = {
+    /**
+     * Every call observed since this handle's handlers were installed, oldest first. The
+     * array is live, so it keeps growing for as long as those handlers stay installed.
+     */
+    readonly calls: readonly MockCall[];
+    /** Drop the recorded calls. The handlers stay installed. */
+    clear(): void;
+};
+"#;
+
+const MOCK_CALL_TYPES_JS: &str = r#"/**
+ * One command invocation observed by a set of mock handlers.
+ *
+ * `command` is the `commands` accessor that was called, e.g. `greet`. A command the
+ * bindings do not generate has no accessor to record, so it keeps the raw Tauri command
+ * name the frontend passed to `invoke` — which is not cased like an accessor.
+ *
+ * @typedef {object} MockCall
+ * @property {string} command The generated command accessor, e.g. `greet`, or, for a
+ * command the bindings don't generate, its raw Tauri command name.
+ * @property {unknown} args The arguments `invoke` received, not a copy; `{}` when the
+ * generated `commands` accessor was called without arguments.
+ */
+
+/**
+ * The handle `mockCommands` returns for the handlers it installed.
+ *
+ * @typedef {object} MockCommandsHandle
+ * @property {readonly MockCall[]} calls Every call observed since this handle's handlers
+ * were installed, oldest first. The array is live, so it keeps growing for as long as
+ * those handlers stay installed.
+ * @property {() => void} clear Drop the recorded calls. The handlers stay installed.
+ */
+"#;
+
+// Keep the original channel and its IPC callback. The symbol shares the mapping
+// across generated modules without retaining channels in a global registry.
+const MAP_CHANNEL_IMPL_TS: &str = r#"const channelTransform = Symbol.for("tauri-specta.channelTransform");
+function mapChannel<T>(channel: Channel<T>, transform: (value: any) => T): Channel<T> {
+    const mapped: Channel<T> & {
+        [channelTransform]?: { handler: (value: T) => void; transform: (value: any) => T };
+    } = channel;
+    const existing = mapped[channelTransform];
+    if (existing) {
+        existing.transform = transform;
+        return channel;
+    }
+    const state = { handler: channel.onmessage, transform };
+    channel.onmessage = (value) => state.handler.call(channel, state.transform(value));
+    Object.defineProperty(channel, "onmessage", {
+        configurable: true,
+        get: () => state.handler,
+        set: (handler: (value: T) => void) => { state.handler = handler; },
+    });
+    Object.defineProperty(channel, channelTransform, { value: state });
+    return channel;
+}
+"#;
+
+const MAP_CHANNEL_IMPL_JS: &str = r#"const channelTransform = Symbol.for("tauri-specta.channelTransform");
+/**
+ * @template T
+ * @param {Channel<T>} channel
+ * @param {(value: any) => T} transform
+ * @returns {Channel<T>}
+ */
+function mapChannel(channel, transform) {
+    /** @type {Channel<T> & { [channelTransform]?: { handler: (value: T) => void; transform: (value: any) => T } }} */
+    const mapped = channel;
+    const existing = mapped[channelTransform];
+    if (existing) {
+        existing.transform = transform;
+        return channel;
+    }
+    const state = { handler: channel.onmessage, transform };
+    channel.onmessage = (value) => state.handler.call(channel, state.transform(value));
+    Object.defineProperty(channel, "onmessage", {
+        configurable: true,
+        get: () => state.handler,
+        set: (/** @type {(value: T) => void} */ handler) => { state.handler = handler; },
+    });
+    Object.defineProperty(channel, channelTransform, { value: state });
+    return channel;
+}
+"#;
+
 const MOCK_COMMANDS_DOC: &str = r#"/**
  * Install typed mock handlers for the generated commands.
  *
  * Handlers are installed through `@tauri-apps/api/mocks`'s `mockIPC`, so the application
- * under test keeps importing the real `commands` object and still runs the argument and
- * result transforms around each call.
+ * under test keeps importing the real `commands` object and still runs the result transform
+ * and channel mapping the bindings wrap around each call.
  *
  * A handler receives the command's arguments and returns its success value; throw (or
  * return a rejected promise) to make the command fail. A command with no handler rejects
  * with an error rather than resolving `undefined`, so a test can't pass by accident.
  *
+ * The returned handle records every call these handlers observe, so a test can assert
+ * what was invoked:
+ *
+ * ```ts
+ * const calls = mockCommands({ greet: ({ myName }) => `Hello, ${myName}!` });
+ * await commands.greet("Brendan");
+ * expect(calls.calls).toEqual([{ command: "greet", args: { myName: "Brendan" } }]);
+ * ```
+ *
+ * `calls` is the live history, oldest first, and grows for as long as these handlers stay
+ * installed. Each entry holds the `commands` accessor that was called and the arguments
+ * `invoke` received — not a copy, and not narrowed to an object, since a raw `invoke` may
+ * pass Tauri's array or buffer payload shapes. `clear()` empties it without uninstalling
+ * anything. Every call is recorded before it is dispatched, including one that fails
+ * because it has no handler or because its handler throws. A command the bindings do not
+ * generate is recorded under its raw Tauri command name, since it has no `commands`
+ * accessor.
+ *
+ * Calling `mockCommands` again installs a fresh set of handlers and returns a fresh handle
+ * with an empty history; the previous handle keeps its calls but stops growing.
+ *
  * Tauri's event mocking is enabled as part of the install (`shouldMockEvents`), so
- * `events` keeps working under test without a second installer fighting this one. Note
- * that Tauri's own mock does not implement `emitTo`, which resolves without reaching any
- * listener. Call `clearMocks` from `@tauri-apps/api/mocks` between tests."#;
+ * `events` and `tauriEvents` keep working under test without a second installer fighting
+ * this one, and the event plugin's internal invokes never reach the record. Note that
+ * Tauri's own mock does not implement `emitTo`, which resolves without reaching any
+ * listener. Call `clearMocks` from `@tauri-apps/api/mocks` between tests; it uninstalls
+ * the handlers but leaves a handle's history alone."#;
 
 const MOCK_HANDLER_REGISTRY_IMPL_TS: &str = r#"    // A copy with no prototype, so a command named after an `Object.prototype` member
     // (`toString`, `constructor`, …) reports that it is unregistered instead of calling
@@ -2056,40 +2468,46 @@ function makeEvent<TListen, TEmit = TListen>(name: string, serialize?: (payload:
 }"#;
 
 const MAKE_EVENT_IMPL_JS: &str = r#"/**
- * @template T
+ * @template TListen
+ * @template [TEmit=TListen]
  * @param {string} name
- * @param {(payload: T) => unknown} [serialize]
- * @param {(payload: any) => T} [deserialize]
+ * @param {(payload: TEmit) => unknown} [serialize]
+ * @param {(payload: any) => TListen} [deserialize]
  */
 function makeEvent(name, serialize, deserialize) {
+    /**
+     * @param {__TAURI_EVENT.EventCallback<TListen>} cb
+     * @returns {(event: __TAURI_EVENT.Event<any>) => void}
+     */
     const mapEvent = (cb) => (event) => cb({ ...event, payload: deserialize ? deserialize(event.payload) : event.payload });
+    /** @param {TEmit} payload */
     const mapPayload = (payload) => serialize ? serialize(payload) : payload;
 
     const base = {
-        /** @param {__TAURI_EVENT.EventCallback<T>} cb */
+        /** @param {__TAURI_EVENT.EventCallback<TListen>} cb */
         listen: (cb) => __TAURI_EVENT.listen(name, mapEvent(cb)),
-        /** @param {__TAURI_EVENT.EventCallback<T>} cb */
+        /** @param {__TAURI_EVENT.EventCallback<TListen>} cb */
         once: (cb) => __TAURI_EVENT.once(name, mapEvent(cb)),
-        /** @param {T} payload */
+        /** @param {TEmit} payload */
         emit: (payload) => __TAURI_EVENT.emit(name, mapPayload(payload)),
         /**
          * @param {__TAURI_EVENT.EventTarget | string} to
-         * @param {T} payload
+         * @param {TEmit} payload
          */
         emitTo: (to, payload) => __TAURI_EVENT.emitTo(to, name, mapPayload(payload)),
     };
 
     /** @param {import("@tauri-apps/api/webview").Webview | import("@tauri-apps/api/window").Window} target */
     const fn = (target) => ({
-        /** @param {__TAURI_EVENT.EventCallback<T>} cb */
+        /** @param {__TAURI_EVENT.EventCallback<TListen>} cb */
         listen: (cb) => target.listen(name, mapEvent(cb)),
-        /** @param {__TAURI_EVENT.EventCallback<T>} cb */
+        /** @param {__TAURI_EVENT.EventCallback<TListen>} cb */
         once: (cb) => target.once(name, mapEvent(cb)),
-        /** @param {T} payload */
+        /** @param {TEmit} payload */
         emit: (payload) => target.emit(name, mapPayload(payload)),
         /**
          * @param {__TAURI_EVENT.EventTarget | string} to
-         * @param {T} payload
+         * @param {TEmit} payload
          */
         emitTo: (to, payload) => target.emitTo(to, name, mapPayload(payload)),
     });
@@ -2156,6 +2574,30 @@ mod tests {
         #[derive(Serialize, Deserialize, Type)]
         #[allow(dead_code)]
         pub struct MockCommandHandlers {
+            value: String,
+        }
+
+        #[derive(Serialize, Deserialize, Type)]
+        #[allow(dead_code)]
+        pub struct MockCall {
+            value: String,
+        }
+
+        #[derive(Serialize, Deserialize, Type)]
+        #[allow(dead_code)]
+        pub struct MockCommandsHandle {
+            value: String,
+        }
+    }
+
+    /// A user type named after something the built-in events runtime declares.
+    mod builtin_event_names {
+        use super::*;
+
+        #[derive(Serialize, Deserialize, Type)]
+        #[serde(rename = "tauriEvents")]
+        #[allow(dead_code)]
+        pub struct TauriEvents {
             value: String,
         }
     }
@@ -2243,7 +2685,7 @@ mod tests {
         let output_dir = std::path::Path::new("target/tests/reserved-runtime-names");
         let _ = fs::remove_dir_all(output_dir);
 
-        let renamed = Builder::<tauri::DynRuntime>::new().typ::<Channel>();
+        let renamed = Builder::<tauri::Wry>::new().typ::<Channel>();
         for (name, layout) in [
             ("flat", Layout::FlatFile),
             ("namespaces", Layout::Namespaces),
@@ -2276,7 +2718,7 @@ mod tests {
         );
 
         let inline_path = output_dir.join("inline.ts");
-        Builder::<tauri::DynRuntime>::new()
+        Builder::<tauri::Wry>::new()
             .typ::<inline::Channel>()
             .export(Typescript::default(), &inline_path)
             .expect("an inline type named Channel should not conflict with the runtime");
@@ -2286,13 +2728,13 @@ mod tests {
                 .contains("export type Channel")
         );
 
-        let err = Builder::<tauri::DynRuntime>::new()
+        let err = Builder::<tauri::Wry>::new()
             .typ::<unrenamed::Channel>()
             .export(Typescript::default(), output_dir.join("unrenamed.ts"))
             .expect_err("a flat export named Channel should conflict with the runtime");
         assert!(err.to_string().contains("User defined type 'Channel'"));
 
-        Builder::<tauri::DynRuntime>::new()
+        Builder::<tauri::Wry>::new()
             .typ::<unrenamed::Channel>()
             .export(JSDoc::default(), output_dir.join("unrenamed.js"))
             .expect_err("a flat JSDoc export named Channel should conflict with the runtime");
@@ -2302,13 +2744,13 @@ mod tests {
             ("unrenamed-module-prefixed", Layout::ModulePrefixedName),
             ("unrenamed-files", Layout::Files),
         ] {
-            Builder::<tauri::DynRuntime>::new()
+            Builder::<tauri::Wry>::new()
                 .typ::<unrenamed::Channel>()
                 .export(Typescript::default().layout(layout), output_dir.join(name))
                 .expect("a scoped Channel should not conflict with the runtime");
         }
 
-        Builder::<tauri::DynRuntime>::new()
+        Builder::<tauri::Wry>::new()
             .typ::<unrenamed::Channel>()
             .export(
                 JSDoc::default().layout(Layout::ModulePrefixedName),
@@ -2316,7 +2758,7 @@ mod tests {
             )
             .expect_err("JSDoc module-prefixed typedefs should retain their bare names");
 
-        Builder::<tauri::DynRuntime>::new()
+        Builder::<tauri::Wry>::new()
             .typ::<unrenamed::Channel>()
             .export(
                 JSDoc::default().layout(Layout::Files),
@@ -2335,7 +2777,7 @@ mod tests {
         ));
         fs::create_dir_all(&output_dir).expect("failed to create test output directory");
 
-        let builder = Builder::<tauri::DynRuntime>::new()
+        let builder = Builder::<tauri::Wry>::new()
             .commands(collect_commands![nullable_result])
             .error_handling(ErrorHandlingMode::DataError);
 
@@ -2352,6 +2794,7 @@ mod tests {
 
         let js_path = output_dir.join("bindings.js");
         builder
+            .clone()
             .export(JSDoc::default(), &js_path)
             .expect("failed to export JSDoc bindings");
         let js = fs::read_to_string(js_path).expect("failed to read JSDoc bindings");
@@ -2361,6 +2804,19 @@ mod tests {
         assert!(
             js.contains("@returns {Promise<{ data: T; error: null } | { data: null; error: E }>}")
         );
+
+        // A user-supplied JavaScript helper need not declare generic type parameters.
+        let custom = r#"async function typedError(result) {
+    return result.then((data) => ({ data, error: null }), (error) => ({ data: null, error }));
+}"#;
+        let custom_js_path = output_dir.join("custom.js");
+        builder
+            .typed_error_impl(custom)
+            .export(JSDoc::default(), &custom_js_path)
+            .expect("failed to export JSDoc with custom typedError");
+        let custom_js = fs::read_to_string(custom_js_path).expect("failed to read custom bindings");
+        assert!(custom_js.contains(custom));
+        assert!(custom_js.contains("=> typedError(__TAURI_INVOKE("));
 
         fs::remove_dir_all(output_dir).expect("failed to remove test output directory");
     }
@@ -2373,7 +2829,7 @@ mod tests {
         ));
         fs::create_dir_all(&output_dir).expect("failed to create test output directory");
 
-        let builder = Builder::<tauri::DynRuntime>::new()
+        let builder = Builder::<tauri::Wry>::new()
             .commands(collect_commands![nullable_result])
             .error_handling(ErrorHandlingMode::ResultUnknown);
 
@@ -2430,26 +2886,23 @@ mod tests {
         for (name, builder) in [
             (
                 "unit",
-                Builder::<tauri::DynRuntime>::new().commands(collect_commands![nullable_error]),
+                Builder::<tauri::Wry>::new().commands(collect_commands![nullable_error]),
             ),
             (
                 "unit-struct",
-                Builder::<tauri::DynRuntime>::new().commands(collect_commands![unit_struct_error]),
+                Builder::<tauri::Wry>::new().commands(collect_commands![unit_struct_error]),
             ),
             (
                 "generic-unit",
-                Builder::<tauri::DynRuntime>::new()
-                    .commands(collect_commands![generic_nullable_error]),
+                Builder::<tauri::Wry>::new().commands(collect_commands![generic_nullable_error]),
             ),
             (
                 "untagged-unit",
-                Builder::<tauri::DynRuntime>::new()
-                    .commands(collect_commands![untagged_nullable_error]),
+                Builder::<tauri::Wry>::new().commands(collect_commands![untagged_nullable_error]),
             ),
             (
                 "floating-point",
-                Builder::<tauri::DynRuntime>::new()
-                    .commands(collect_commands![floating_point_error]),
+                Builder::<tauri::Wry>::new().commands(collect_commands![floating_point_error]),
             ),
         ] {
             let output_path = std::env::temp_dir().join(format!(
@@ -2482,7 +2935,7 @@ mod tests {
             "tauri-specta-nullable-semantic-error-test-{}.ts",
             std::process::id()
         ));
-        let err = Builder::<tauri::DynRuntime>::new()
+        let err = Builder::<tauri::Wry>::new()
             .commands(collect_commands![semantic_nullable_error])
             .semantic_types(semantic_types)
             .error_handling(ErrorHandlingMode::DataError)
@@ -2494,6 +2947,66 @@ mod tests {
     }
 
     #[test]
+    fn builtin_event_runtime_names_are_reserved() {
+        let output_dir = std::path::Path::new("target/tests/builtin-events-reserved-names");
+        let _ = fs::remove_dir_all(output_dir);
+        fs::create_dir_all(output_dir).expect("failed to create test output directory");
+
+        // `tauriEvents` is always emitted, so a user type with that name can never be
+        // exported, by either exporter.
+        let ts_err = Builder::<tauri::Wry>::new()
+            .typ::<builtin_event_names::TauriEvents>()
+            .export(Typescript::default(), output_dir.join("bindings.ts"))
+            .expect_err("`tauriEvents` should always be reserved");
+        assert!(
+            ts_err
+                .to_string()
+                .contains("User defined type 'tauriEvents'"),
+            "{ts_err}"
+        );
+
+        let jsdoc_err = Builder::<tauri::Wry>::new()
+            .typ::<builtin_event_names::TauriEvents>()
+            .export(JSDoc::default(), output_dir.join("bindings.js"))
+            .expect_err("`tauriEvents` should always be reserved");
+        assert!(
+            jsdoc_err
+                .to_string()
+                .contains("User defined type 'tauriEvents'"),
+            "{jsdoc_err}"
+        );
+
+        fs::remove_dir_all(output_dir).expect("failed to remove test output directory");
+    }
+
+    #[test]
+    fn builtin_event_names_are_not_plugin_prefixed() {
+        // Built-in events are emitted by Tauri itself, so they must not pick up the
+        // plugin name the user's own commands and events are prefixed with.
+        let output_dir = std::path::Path::new("target/tests/builtin-events-plugin-name");
+        let _ = fs::remove_dir_all(output_dir);
+        fs::create_dir_all(output_dir).expect("failed to create test output directory");
+
+        Builder::<tauri::Wry>::new()
+            .plugin_name("my-plugin")
+            .export(Typescript::default(), output_dir.join("bindings.ts"))
+            .expect("failed to export TypeScript bindings");
+
+        let ts = fs::read_to_string(output_dir.join("bindings.ts"))
+            .expect("failed to read TypeScript bindings");
+        assert!(
+            ts.contains(r#"makeEvent<{ label: string }>("tauri://window-created")"#),
+            "built-in event names should stay unprefixed:\n{ts}"
+        );
+        assert!(
+            !ts.contains(r#""plugin:my-plugin|tauri://"#),
+            "built-in event names must not be plugin-prefixed:\n{ts}"
+        );
+
+        fs::remove_dir_all(output_dir).expect("failed to remove test output directory");
+    }
+
+    #[test]
     fn mock_runtime_names_are_only_reserved_for_a_mocks_export() {
         let output_dir = std::path::Path::new("target/tests/mocks-reserved-names");
         let _ = fs::remove_dir_all(output_dir);
@@ -2501,7 +3014,7 @@ mod tests {
 
         // The mocks runtime is opt-in, so its names must not stop a user type from
         // exporting on a build that never emits it.
-        let builder = Builder::<tauri::DynRuntime>::new().typ::<mock_names::MockCommandHandlers>();
+        let builder = Builder::<tauri::Wry>::new().typ::<mock_names::MockCommandHandlers>();
 
         builder
             .export(Typescript::default(), output_dir.join("bindings.ts"))
@@ -2521,7 +3034,7 @@ mod tests {
                 .contains("MockCommandHandlers")
         );
 
-        let err = Builder::<tauri::DynRuntime>::new()
+        let err = Builder::<tauri::Wry>::new()
             .commands(collect_commands![nullable_result])
             .mocks()
             .typ::<mock_names::MockCommandHandlers>()
@@ -2532,6 +3045,35 @@ mod tests {
                 .contains("User defined type 'MockCommandHandlers'"),
             "{err}"
         );
+
+        // `MockCall` and `MockCommandsHandle` are declared by the mocks runtime too, so
+        // they are reserved under the same rule.
+        for (name, result) in [
+            (
+                "MockCall",
+                Builder::<tauri::Wry>::new()
+                    .commands(collect_commands![nullable_result])
+                    .mocks()
+                    .typ::<mock_names::MockCall>()
+                    .export(Typescript::default(), output_dir.join("conflict-call.ts")),
+            ),
+            (
+                "MockCommandsHandle",
+                Builder::<tauri::Wry>::new()
+                    .commands(collect_commands![nullable_result])
+                    .mocks()
+                    .typ::<mock_names::MockCommandsHandle>()
+                    .export(Typescript::default(), output_dir.join("conflict-handle.ts")),
+            ),
+        ] {
+            let err =
+                result.expect_err("mocks runtime names should be reserved by `Builder::mocks`");
+            assert!(
+                err.to_string()
+                    .contains(&format!("User defined type '{name}'")),
+                "{err}"
+            );
+        }
 
         fs::remove_dir_all(output_dir).expect("failed to remove test output directory");
     }
@@ -2544,7 +3086,7 @@ mod tests {
 
         // Without a semantic type there is no transform, so the handler is typed against
         // the value that really crosses the IPC boundary.
-        Builder::<tauri::DynRuntime>::new()
+        Builder::<tauri::Wry>::new()
             .commands(collect_commands![nested_semantic_bytes])
             .mocks()
             .export(Typescript::default(), output_dir.join("bindings.ts"))
@@ -2558,7 +3100,7 @@ mod tests {
         // A rule nested in a struct does get a transform, and the handler would be handed
         // the transformed value. That can't be typed without re-deriving the transform's
         // output type, so it is refused rather than mistyped.
-        let err = Builder::<tauri::DynRuntime>::new()
+        let err = Builder::<tauri::Wry>::new()
             .commands(collect_commands![nested_semantic_bytes])
             .semantic_types(semantic_bytes())
             .mocks()
@@ -2581,7 +3123,7 @@ mod tests {
         let _ = fs::remove_dir_all(output_dir);
         fs::create_dir_all(output_dir).expect("failed to create test output directory");
 
-        Builder::<tauri::DynRuntime>::new()
+        Builder::<tauri::Wry>::new()
             .plugin_name("my-plugin")
             .commands(collect_commands![nullable_result])
             .mocks()
@@ -2592,7 +3134,7 @@ mod tests {
             .expect("failed to read TypeScript bindings");
         assert!(
             ts.contains(
-                r#"case "plugin:my-plugin|nullable_result": return mockCommandHandler(mockHandlers.nullableResult, "plugin:my-plugin|nullable_result", args);"#
+                r#"case "plugin:my-plugin|nullable_result": calls.push({ command: "nullableResult", args }); return mockCommandHandler(mockHandlers.nullableResult, "plugin:my-plugin|nullable_result", args);"#
             ),
             "{ts}"
         );
@@ -2601,10 +3143,7 @@ mod tests {
     }
 
     #[test]
-    fn result_unknown_mode_widens_error_transform_input() {
-        // The error is typed `unknown`, so a transform written against the command's
-        // error type (`BigInt(v.error)`) would not type-check. The generated mapper
-        // widens the input; the runtime value is unchanged.
+    fn semantic_error_transforms_only_apply_to_typed_errors() {
         let semantic_types =
             specta_typescript::semantic::Configuration::empty().enable_lossless_bigints();
 
@@ -2612,33 +3151,28 @@ mod tests {
             "tauri-specta-result-unknown-semantic-error-test-{}.ts",
             std::process::id()
         ));
-        Builder::<tauri::DynRuntime>::new()
+        Builder::<tauri::Wry>::new()
             .commands(collect_commands![bigint_error])
             .semantic_types(semantic_types.clone())
             .error_handling(ErrorHandlingMode::ResultUnknown)
+            .mocks()
             .export(Typescript::default(), &unknown_path)
-            .expect("failed to export TypeScript bindings");
+            .expect("mocks are allowed because ResultUnknown leaves errors untouched");
         let ts = fs::read_to_string(&unknown_path).expect("failed to read TypeScript bindings");
-        assert!(
-            ts.contains("BigInt((v.error as any))"),
-            "the error transform should be widened to accept `unknown`:\n{ts}"
-        );
+        assert!(!ts.contains("BigInt("), "{ts}");
 
-        // `Result` types the error as the command's own type, so the transform stays narrow.
+        // `Result` still assumes the error has the declared type and transforms it.
         let result_path = std::env::temp_dir().join(format!(
             "tauri-specta-result-semantic-error-test-{}.ts",
             std::process::id()
         ));
-        Builder::<tauri::DynRuntime>::new()
+        Builder::<tauri::Wry>::new()
             .commands(collect_commands![bigint_error])
             .semantic_types(semantic_types)
             .error_handling(ErrorHandlingMode::Result)
             .export(Typescript::default(), &result_path)
             .expect("failed to export TypeScript bindings");
         let ts = fs::read_to_string(&result_path).expect("failed to read TypeScript bindings");
-        assert!(
-            ts.contains("BigInt(v.error)") && !ts.contains("(v.error as any)"),
-            "`Result` should keep the narrow error transform:\n{ts}"
-        );
+        assert!(ts.contains("BigInt(v.error)"), "{ts}");
     }
 }

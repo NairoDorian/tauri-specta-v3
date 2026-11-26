@@ -30,6 +30,9 @@ use tauri_specta::{
     Builder, Casing, ErrorHandlingMode, Event, LanguageExt, collect_commands, collect_events,
 };
 
+#[path = "support/semantic_channels.rs"]
+mod semantic_channels;
+
 // ----- types -----
 
 /// A struct with a doc comment and common field shapes.
@@ -64,7 +67,7 @@ enum UntaggedEnum {
     Text(String),
 }
 
-#[derive(Serialize, Deserialize, Type)]
+#[derive(Serialize, Deserialize, Type, Event)]
 struct PhaseSpecificRename {
     #[serde(rename(serialize = "serialized_value", deserialize = "deserialized_value"))]
     value: String,
@@ -114,98 +117,86 @@ struct StructEvent {
 
 /// A command with a doc comment.
 #[tauri::command]
-#[specta::specta]
 fn greet(my_name: String) -> String {
     format!("Hello, {my_name}!")
 }
 
 #[tauri::command]
-#[specta::specta]
 fn unit_command() {}
 
 #[tauri::command(async)]
-#[specta::specta]
 async fn async_command(delay_ms: u32) -> u32 {
     delay_ms
 }
 
 #[tauri::command]
-#[specta::specta]
 fn many_args(a: String, b: i32, c: bool, d: Vec<String>, e: Option<String>) -> bool {
     c
 }
 
 #[tauri::command]
-#[specta::specta]
 fn echo_profile(profile: Profile) -> Profile {
     profile
 }
 
 #[tauri::command]
-#[specta::specta]
 fn tuple_types(point: Point) -> Wrapper {
     Wrapper(format!("{}:{}", point.0, point.1))
 }
 
 #[tauri::command]
-#[specta::specta]
 fn enums(tagged: TaggedEnum, untagged: UntaggedEnum) -> TaggedEnum {
     tagged
 }
 
 #[tauri::command]
-#[specta::specta]
 fn phase_specific_rename(input: PhaseSpecificRename) -> PhaseSpecificRename {
     input
 }
 
 #[tauri::command]
-#[specta::specta]
 fn big_numbers(input: BigNumbers) -> BigNumbers {
     input
 }
 
 #[tauri::command]
-#[specta::specta]
 fn plain_error() -> Result<String, PlainError> {
     Err(PlainError::NotFound)
 }
 
 #[tauri::command]
-#[specta::specta]
 fn tagged_error() -> Result<Profile, TaggedError> {
     Err(TaggedError::Parse { line: 7 })
 }
 
 #[tauri::command]
-#[specta::specta]
 fn nullable_result() -> Result<Option<String>, PlainError> {
     Ok(None)
 }
 
 #[tauri::command]
-#[specta::specta]
+fn bigint_result() -> Result<u64, u64> {
+    Ok(42)
+}
+
+#[tauri::command]
 fn maybe() -> Option<String> {
     None
 }
 
 #[tauri::command]
-#[specta::specta]
 fn with_channel(channel: tauri::ipc::Channel<i32>) {}
 
 #[tauri::command]
-#[specta::specta]
 fn skipped_args(state: tauri::State<'_, String>, visible: String) -> String {
     visible
 }
 
 #[tauri::command]
-#[specta::specta]
 fn generic<R: tauri::Runtime>(window: tauri::Window<R>) {}
 
 #[deprecated = "This is a deprecated command"]
 #[tauri::command]
-#[specta::specta]
 fn deprecated_command() {}
 
 // ----- builders -----
@@ -259,13 +250,11 @@ fn empty() -> Builder<MockRuntime> {
 /// `valueOf` are `Object.prototype` members, so a lookup that doesn't check own
 /// properties finds an inherited function instead of reporting the command as unmocked.
 #[tauri::command]
-#[specta::specta]
 fn to_string() -> String {
     "to string".to_string()
 }
 
 #[tauri::command]
-#[specta::specta]
 fn value_of() -> String {
     "value of".to_string()
 }
@@ -346,6 +335,8 @@ const SCENARIOS: &[&str] = &[
     "error_result_jsdoc",
     "error_result_ts",
     "error_result_unknown_jsdoc",
+    "error_result_unknown_semantic_jsdoc",
+    "error_result_unknown_semantic_ts",
     "error_result_unknown_ts",
     "error_throw_jsdoc",
     "error_throw_ts",
@@ -368,6 +359,8 @@ const SCENARIOS: &[&str] = &[
     "no_serde_phases_ts",
     "plugin_jsdoc",
     "plugin_ts",
+    "semantic_channels_jsdoc",
+    "semantic_channels_ts",
 ];
 
 /// `UPDATE_SNAPSHOTS=1` (or `true`) regenerates the committed fixtures. Any other
@@ -514,6 +507,26 @@ fn scenario_list_matches_snapshots() {
 // ----- default configuration -----
 
 #[test]
+fn semantic_channels_ts() {
+    assert_export(
+        "semantic_channels_ts",
+        "bindings.ts",
+        &semantic_channels::builder(),
+        Typescript::default(),
+    );
+}
+
+#[test]
+fn semantic_channels_jsdoc() {
+    assert_export(
+        "semantic_channels_jsdoc",
+        "bindings.js",
+        &semantic_channels::builder(),
+        JSDoc::default(),
+    );
+}
+
+#[test]
 fn kitchen_sink_ts() {
     assert_export(
         "kitchen_sink_ts",
@@ -599,10 +612,15 @@ fn events_only_ts() {
 
 #[test]
 fn events_only_jsdoc() {
+    let builder = Builder::<MockRuntime>::new().events(collect_events![
+        EmptyEvent,
+        StructEvent,
+        PhaseSpecificRename
+    ]);
     assert_export(
         "events_only_jsdoc",
         "bindings.js",
-        &events_only(),
+        &builder,
         JSDoc::default(),
     );
 }
@@ -723,6 +741,35 @@ fn error_result_unknown_jsdoc() {
         "error_result_unknown_jsdoc",
         "bindings.js",
         &builder,
+        JSDoc::default(),
+    );
+}
+
+fn result_unknown_semantic() -> Builder<MockRuntime> {
+    Builder::<MockRuntime>::new()
+        .commands(collect_commands![bigint_result])
+        .semantic_types(
+            specta_typescript::semantic::Configuration::empty().enable_lossless_bigints(),
+        )
+        .error_handling(ErrorHandlingMode::ResultUnknown)
+}
+
+#[test]
+fn error_result_unknown_semantic_ts() {
+    assert_export(
+        "error_result_unknown_semantic_ts",
+        "bindings.ts",
+        &result_unknown_semantic(),
+        Typescript::default(),
+    );
+}
+
+#[test]
+fn error_result_unknown_semantic_jsdoc() {
+    assert_export(
+        "error_result_unknown_semantic_jsdoc",
+        "bindings.js",
+        &result_unknown_semantic(),
         JSDoc::default(),
     );
 }

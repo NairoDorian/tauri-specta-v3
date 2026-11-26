@@ -1,7 +1,7 @@
 //! Regression coverage for https://github.com/specta-rs/tauri-specta/issues/260.
 //!
 //! `#[tauri::command(rename = "...")]` changes the name Tauri's invoke handler matches
-//! against, but `#[specta::specta]` names the function after its Rust identifier. These
+//! against while the generated accessor keeps following the Rust identifier. These
 //! tests guard that the generated bindings invoke the renamed name while the frontend
 //! accessor still follows the Rust identifier.
 
@@ -18,32 +18,27 @@ use tauri_specta::{Builder, Casing, collect_commands};
 // macros at the crate root of the test crate, which collides with the other commands.
 
 #[tauri::command(rename = "renamed_greet")]
-#[specta::specta]
 fn greet() -> String {
     "hi".to_string()
 }
 
 #[tauri::command(rename = "renamed_greet_world")]
-#[specta::specta]
 fn greet_world() -> String {
     "hi".to_string()
 }
 
 #[tauri::command(rename = "renamed_generic")]
-#[specta::specta]
 fn generic_command<R: tauri::Runtime>(_app: tauri::AppHandle<R>) -> String {
     "generic".to_string()
 }
 
 #[tauri::command]
-#[specta::specta]
 fn unrenamed() -> String {
     "plain".to_string()
 }
 
 mod nested {
     #[tauri::command(rename = "nested_renamed")]
-    #[specta::specta]
     pub fn nested_command() -> String {
         "nested".to_string()
     }
@@ -52,7 +47,6 @@ mod nested {
 mod outer {
     pub mod inner {
         #[tauri::command(rename = "deep_renamed")]
-        #[specta::specta]
         pub fn deep_command() -> String {
             "deep".to_string()
         }
@@ -97,11 +91,13 @@ fn invoke(
             cmd: cmd.into(),
             callback: tauri::ipc::CallbackFn(0),
             error: tauri::ipc::CallbackFn(1),
-            // Tauri 3 asks the runtime for its scheme URL, and `MockRuntime`
-            // answers `tauri://localhost` on every platform. Windows' real
-            // `http://tauri.localhost` would read as a remote origin here, which
-            // needs an ACL for app commands.
-            url: "tauri://localhost".parse().unwrap(),
+            url: if cfg!(any(windows, target_os = "android")) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            }
+            .parse()
+            .unwrap(),
             body: tauri::ipc::InvokeBody::default(),
             headers: Default::default(),
             invoke_key: tauri::test::INVOKE_KEY.to_string(),
@@ -157,8 +153,8 @@ fn accessor_follows_rust_identifier_and_function_casing() {
 
 #[test]
 fn generic_command_with_rename() {
-    let builder = Builder::<MockRuntime>::new()
-        .commands(collect_commands![generic_command::<tauri::DynRuntime>]);
+    let builder =
+        Builder::<MockRuntime>::new().commands(collect_commands![generic_command::<tauri::Wry>]);
 
     let bindings = export(&builder);
     assert!(
@@ -229,13 +225,13 @@ fn mock_handler_is_keyed_by_accessor_and_dispatched_by_renamed_name() {
     );
     assert!(
         bindings.contains(
-            r#"case "renamed_greet": return mockCommandHandler(mockHandlers.greet, "renamed_greet", args);"#
+            r#"case "renamed_greet": calls.push({ command: "greet", args }); return mockCommandHandler(mockHandlers.greet, "renamed_greet", args);"#
         ),
         "the switch should match the renamed IPC name:\n{bindings}"
     );
     assert!(
         bindings.contains(
-            r#"case "unrenamed": return mockCommandHandler(mockHandlers.unrenamed, "unrenamed", args);"#
+            r#"case "unrenamed": calls.push({ command: "unrenamed", args }); return mockCommandHandler(mockHandlers.unrenamed, "unrenamed", args);"#
         ),
         "{bindings}"
     );

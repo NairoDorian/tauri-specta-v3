@@ -9,10 +9,9 @@
 //!
 //! # Backend setup
 //!
-//! Annotate commands with both `#[tauri::command]` and `#[specta::specta]`, then
-//! pass separate command collections to [`CommandSet::new`]. The string returned
-//! by [`CommandSet::build`] must be supplied to the TypeScript exporter with
-//! `Typescript::with_raw`.
+//! Annotate commands with `#[tauri::command]` and pass separate command collections
+//! to [`CommandSet::new`]. The string returned by [`CommandSet::build`] must be
+//! supplied to the TypeScript exporter with `Typescript::with_raw`.
 //!
 //! ```rust,no_run
 //! use specta_typescript::Typescript;
@@ -20,18 +19,16 @@
 //! use tauri_specta_query::{CommandSet, TanstackQueryFramework};
 //!
 //! #[tauri::command]
-//! #[specta::specta]
 //! fn get_user(id: u32) -> String {
 //!     format!("user-{id}")
 //! }
 //!
 //! #[tauri::command]
-//! #[specta::specta]
 //! fn rename_user(id: u32, name: String) {
 //!     // Update the user in your application state.
 //! }
 //!
-//! let commands = CommandSet::<tauri::DynRuntime>::new(
+//! let commands = CommandSet::<tauri::Wry>::new(
 //!     collect_commands![get_user],
 //!     collect_commands![rename_user],
 //! );
@@ -89,8 +86,7 @@
 //! Function casing changes the generated query, mutation, and command accessor
 //! properties only. It does not change the Tauri command string or command
 //! arguments in the runtime IPC message. Argument renaming is configured per
-//! command; keep `#[tauri::command(rename_all = "...")]` and
-//! `#[specta(rename_all = "...")]` aligned when using it.
+//! command; Tauri's `rename_all` is applied by the generated bindings.
 //!
 //! # Frameworks
 //!
@@ -113,11 +109,10 @@
 
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
-use heck::ToLowerCamelCase;
 use serde::Serialize;
-use specta::{Type, Types, datatype};
+use specta::{Type, Types};
 use tauri::{Runtime, ipc::Invoke};
-use tauri_specta::{Casing, CollectedCommands, Commands, Events};
+use tauri_specta::{Casing, CollectedCommands, Command, Commands, Events};
 
 /// A collection of query commands, mutation commands, and their shared bindings.
 ///
@@ -125,9 +120,8 @@ use tauri_specta::{Casing, CollectedCommands, Commands, Events};
 /// bindings, and finish it with [`CommandSet::build`].
 pub struct CommandSet<R: Runtime> {
     handler: Arc<dyn Fn(Invoke<R>) -> bool + Send + Sync + 'static>,
-    queries: Vec<datatype::Function>,
-    mutations: Vec<datatype::Function>,
-    accessor_names: BTreeMap<Cow<'static, str>, Cow<'static, str>>,
+    queries: Vec<Command>,
+    mutations: Vec<Command>,
     types: Types,
     events: Events,
     constants: BTreeMap<Cow<'static, str>, serde_json::Value>,
@@ -135,11 +129,9 @@ pub struct CommandSet<R: Runtime> {
 }
 
 impl<R: Runtime> CommandSet<R> {
-    /// The name a function's generated accessor is derived from, before casing.
-    fn accessor_name<'a>(&'a self, function: &'a datatype::Function) -> &'a str {
-        self.accessor_names
-            .get(function.name())
-            .map_or_else(|| function.name(), |name| name.as_ref())
+    /// The name a command's generated accessor is derived from, before casing.
+    fn accessor_name<'a>(&'a self, command: &'a Command) -> &'a str {
+        &command.accessor
     }
 
     /// Creates a command set from query commands and mutation commands.
@@ -155,8 +147,8 @@ impl<R: Runtime> CommandSet<R> {
         let query_collected = query_types(&mut types);
         let mutation_collected = mutation_types(&mut types);
 
-        let mut accessor_names = query_collected.accessor_names;
-        accessor_names.extend(mutation_collected.accessor_names);
+        let query_commands = query_collected.commands;
+        let mutation_commands = mutation_collected.commands;
 
         Self {
             handler: Arc::new(move |i| {
@@ -166,9 +158,8 @@ impl<R: Runtime> CommandSet<R> {
                     acl: i.acl.clone(),
                 }) || (mutation_invoke)(i)
             }),
-            queries: query_collected.functions,
-            mutations: mutation_collected.functions,
-            accessor_names,
+            queries: query_commands,
+            mutations: mutation_commands,
             types,
             events: Default::default(),
             constants: Default::default(),
@@ -230,14 +221,13 @@ impl<R: Runtime> CommandSet<R> {
     /// This changes frontend accessor properties only. It does not change the
     /// underlying Tauri command string or rename command arguments. Argument
     /// renaming is a separate per-command IPC contract configured with matching
-    /// `#[tauri::command(rename_all = "...")]` and
-    /// `#[specta(rename_all = "...")]` attributes.
+    /// `#[tauri::command(rename_all = "...")]` attribute.
     ///
     /// ```rust
     /// use tauri_specta::{Casing, collect_commands};
     /// use tauri_specta_query::CommandSet;
     ///
-    /// let commands = CommandSet::<tauri::DynRuntime>::new(
+    /// let commands = CommandSet::<tauri::Wry>::new(
     ///     collect_commands![],
     ///     collect_commands![],
     /// )
@@ -264,9 +254,6 @@ impl<R: Runtime> CommandSet<R> {
         let mut constants = self.constants.clone();
         constants.extend(other.constants.clone());
 
-        let mut accessor_names = self.accessor_names.clone();
-        accessor_names.extend(other.accessor_names.clone());
-
         Self {
             handler: Arc::new(move |i| {
                 (handler)(Invoke {
@@ -282,7 +269,6 @@ impl<R: Runtime> CommandSet<R> {
                 .chain(&other.mutations)
                 .cloned()
                 .collect(),
-            accessor_names,
             types,
             events: self.events.clone().merge(other.events.clone()),
             constants,
@@ -300,7 +286,18 @@ impl<R: Runtime> CommandSet<R> {
     #[must_use]
     pub fn build(self, framework: TanstackQueryFramework) -> (String, tauri_specta::Builder<R>) {
         let output = {
-            let mut output = format!("/** Tanstack Query */\n{}\n", framework.import());
+            let mut output = String::from("/** Tanstack Query */\n");
+            let imports = match (self.queries.is_empty(), self.mutations.is_empty()) {
+                (false, false) => Some("mutationOptions, queryOptions"),
+                (false, true) => Some("queryOptions"),
+                (true, false) => Some("mutationOptions"),
+                (true, true) => None,
+            };
+            if let (Some(package), Some(imports)) = (framework.package(), imports) {
+                output.push_str(&format!("import {{ {imports} }} from '{package}';\n"));
+            } else {
+                output.push('\n');
+            }
 
             if !self.queries.is_empty() {
                 output.push_str("\nexport const queries = {");
@@ -361,15 +358,16 @@ impl<R: Runtime> CommandSet<R> {
                         .args
                         .iter()
                         .enumerate()
-                        .map(|(idx, (arg, _))| {
-                            let arg = arg.to_lower_camel_case();
-                            format!("{arg}: Parameters<typeof {command}>[{idx}]")
+                        .map(|(idx, arg)| {
+                            // Mutation inputs mirror the IPC payload, so use Tauri's key.
+                            let key = render_property_name(&arg.name);
+                            format!("{key}: Parameters<typeof {command}>[{idx}]")
                         })
                         .collect::<Vec<_>>();
                     let arg_names = function
                         .args
                         .iter()
-                        .map(|(arg, _)| arg.to_lower_camel_case())
+                        .map(|arg| arg.name.to_string())
                         .collect::<Vec<_>>();
 
                     let mutation_fn = if args.is_empty() {
@@ -380,7 +378,7 @@ impl<R: Runtime> CommandSet<R> {
                             args.join("; "),
                             arg_names
                                 .iter()
-                                .map(|arg| format!("input.{arg}"))
+                                .map(|arg| render_member_access("input", arg))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         )
@@ -430,7 +428,6 @@ impl<R: Runtime> CommandSet<R> {
         let mut commands = self.queries;
         commands.extend(self.mutations);
         let types = self.types;
-        let accessor_names = self.accessor_names;
 
         let mut builder = tauri_specta::Builder::<R>::new()
             .commands(Commands(
@@ -438,8 +435,7 @@ impl<R: Runtime> CommandSet<R> {
                 Arc::new(move |tys| {
                     tys.extend(&types);
                     CollectedCommands {
-                        functions: commands.clone(),
-                        accessor_names: accessor_names.clone(),
+                        commands: commands.clone(),
                     }
                 }),
             ))
@@ -500,18 +496,14 @@ pub enum TanstackQueryFramework {
 }
 
 impl TanstackQueryFramework {
-    fn import(self) -> &'static str {
+    fn package(self) -> Option<&'static str> {
         match self {
-            Self::React => "import { mutationOptions, queryOptions } from '@tanstack/react-query';",
-            Self::Solid => "import { mutationOptions, queryOptions } from '@tanstack/solid-query';",
-            Self::Vue => "import { mutationOptions, queryOptions } from '@tanstack/vue-query';",
-            Self::Angular => {
-                "import { mutationOptions, queryOptions } from '@tanstack/angular-query-experimental';"
-            }
-            Self::Svelte => "",
-            Self::Preact => {
-                "import { mutationOptions, queryOptions } from '@tanstack/preact-query';"
-            }
+            Self::React => Some("@tanstack/react-query"),
+            Self::Solid => Some("@tanstack/solid-query"),
+            Self::Vue => Some("@tanstack/vue-query"),
+            Self::Angular => Some("@tanstack/angular-query-experimental"),
+            Self::Svelte => None,
+            Self::Preact => Some("@tanstack/preact-query"),
         }
     }
 
@@ -541,15 +533,18 @@ mod tests {
     use super::{CommandSet, TanstackQueryFramework};
 
     #[tauri::command]
-    #[specta::specta]
     fn get_user(user_id: u32) -> String {
         format!("user-{user_id}")
     }
 
     #[tauri::command]
-    #[specta::specta]
     fn rename_user(user_id: u32, display_name: String) {
         let _ = (user_id, display_name);
+    }
+
+    #[tauri::command]
+    fn set_rank(_1st: String) {
+        let _ = _1st;
     }
 
     fn export(casing: Casing) -> String {
@@ -597,6 +592,38 @@ mod tests {
         assert!(output.contains(r#"queryFn: () => commands["get-user"](...args)"#));
         assert!(output.contains(r#""rename-user": () => mutationOptions"#));
         assert!(output.contains(r#"commands["rename-user"](input.userId, input.displayName)"#));
+    }
+
+    #[test]
+    fn mutation_quotes_ipc_keys_that_are_not_identifiers() {
+        let (bindings, _) =
+            CommandSet::<MockRuntime>::new(collect_commands![], collect_commands![set_rank])
+                .build(TanstackQueryFramework::React);
+
+        assert!(
+            bindings.contains(
+                r#"(input: { "1st": Parameters<typeof commands.setRank>[0] }) => commands.setRank(input["1st"])"#
+            ),
+            "{bindings}"
+        );
+    }
+
+    #[test]
+    fn only_imports_option_helpers_that_are_used() {
+        let framework = TanstackQueryFramework::React;
+        let (query_only, _) =
+            CommandSet::<MockRuntime>::new(collect_commands![get_user], collect_commands![])
+                .build(framework);
+        assert!(query_only.contains("import { queryOptions } from '@tanstack/react-query';"));
+
+        let (mutation_only, _) =
+            CommandSet::<MockRuntime>::new(collect_commands![], collect_commands![rename_user])
+                .build(framework);
+        assert!(mutation_only.contains("import { mutationOptions } from '@tanstack/react-query';"));
+
+        let (empty, _) = CommandSet::<MockRuntime>::new(collect_commands![], collect_commands![])
+            .build(framework);
+        assert!(!empty.contains("import "));
     }
 
     #[test]
