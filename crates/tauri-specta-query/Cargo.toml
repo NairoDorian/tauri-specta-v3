@@ -19,8 +19,8 @@ categories = ["web-programming", "asynchronous"]
 all-features = true
 
 [features]
-# Mirrors `tauri-specta`: the v2 pin is on unless default features are disabled.
-default = ["v2"]
+# Mirrors `tauri-specta`: in this fork the v2 pin is opt-in.
+default = []
 v2 = ["tauri-specta/v2"]
 
 [dependencies]

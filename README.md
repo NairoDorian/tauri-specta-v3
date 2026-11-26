@@ -13,6 +13,36 @@
 > [!NOTE]
 > This branch contains tauri-specta v2, you can checkout the git tag [v1.0.2](https://github.com/specta-rs/tauri-specta/tree/v1.0.2) for the previous version.
 
+## This fork
+
+`NairoDorian/tauri-specta-v3` is upstream `specta-rs/tauri-specta` `main` for Tauri v3
+applications ([ZER0](https://github.com/NairoDorian/S2B2S) and
+[Sift](https://github.com/NairoDorian/Sift_PDF_to_MD)). Each upstream merge keeps three changes
+on top:
+
+- **Commands are collected with `#[specta::specta]`** (upstream's `macro_rules!`
+  `collect_commands!` from before #287). Upstream now reads command types only from Tauri's
+  command metadata (tauri-apps/tauri#15326), which is merged on Tauri's `dev` branch (v2) but is
+  in no Tauri v3 build yet, published or on the `v3` branch: upstream's own v3 job fails until
+  then. The `introspection` feature still selects upstream's collector where Tauri has it.
+- **No Tauri v2 pin by default** (`default = []`): upstream's default `v2` feature adds a
+  `tauri = "2"` edge that a Tauri v3 graph cannot resolve.
+- **Every 3.0.0 alpha is admitted** (`tauri = ">=2, <3.0.0-beta"`; upstream: the newest tested
+  alpha): the applications pin their Tauri family with `=` and test each alpha themselves.
+
+```toml
+tauri-specta = { git = "https://github.com/NairoDorian/tauri-specta-v3", default-features = false, features = ["derive", "typescript"] }
+specta = "=2.0.0-rc.28"            # exactly the Specta this crate builds against
+specta-typescript = "0.0.15"
+```
+
+Taking a newer upstream: `git fetch upstream && git merge upstream/main`, keep the three changes,
+then run `cargo test -p tauri-specta -p tauri-specta-query -p tauri-specta-macros --all-features`
+(Tauri v2 `dev`, upstream's collector) and `cargo test --manifest-path tests/tauri-v3/Cargo.toml`
+(published Tauri v3, this fork's collector), and compare the two exports byte for byte
+(`tests/tauri-v3/README.md`, "Binding parity with v2"). The first change goes once a Tauri v3
+release carries the command metadata; the fork goes once upstream publishes for Tauri v3.
+
 ## Getting Started
 
 First you will need to choose a version:

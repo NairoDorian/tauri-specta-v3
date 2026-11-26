@@ -21,10 +21,11 @@ categories = ["web-programming", "asynchronous"]
 features = ["derive", "javascript", "typescript"]
 
 [features]
-# Tauri v2 is the default: this pins `tauri` to 2.x so an unconstrained consumer
-# does not resolve the v3 prerelease that the dependency range also admits. Disable
-# default features and depend on Tauri v3 yourself to use v3.
-default = ["v2"]
+# This fork serves Tauri v3 applications, so the v2 pin is opt-in here. Upstream
+# makes `v2` the default so that an unconstrained consumer does not resolve the v3
+# prerelease the dependency range also admits, but its `tauri = "2"` edge makes a
+# Tauri v3 graph unresolvable (both majors declare `links = "Tauri"`).
+default = []
 v2 = ["dep:tauri-specta-pin"]
 # Read command types from Tauri's IPC introspection, so commands do not need
 # `#[specta::specta]`. Requires a Tauri build with tauri-apps/tauri#15326 (merged,
@@ -83,8 +84,11 @@ todo = { level = "warn", priority = -1 }
 panic_in_result_fn = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-# Bound v3 prereleases to the latest tested alpha. Applications select their Tauri major.
-tauri = { version = ">=2, <=3.0.0-alpha.6", default-features = false }
+# Applications select their Tauri major. Upstream bounds v3 prereleases to the latest
+# tested alpha; this fork admits every 3.0.0 alpha, because the applications it serves
+# pin their Tauri family with `=` and build and test each new alpha themselves.
+# tests/tauri-v3 records the alpha tested here.
+tauri = { version = ">=2, <3.0.0-beta", default-features = false }
 tauri-build = { version = "2" }
 tauri-plugin = { version = "2" }
 specta = { version = "=2.0.0-rc.28", features = ["derive"] }
